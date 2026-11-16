@@ -1,0 +1,53 @@
+# Every key except apps[].name, command and listen is optional; the values shown are the defaults.
+
+# Where releases and the current version of each app are kept. Put it on a volume to keep them across
+# container restarts. Also DROVER_DATA. Default: $HOME/.local/share/drover (no ~ expansion here).
+data: /home/app/.local/share/drover
+
+admin:
+  # Also the --admin flag, or DROVER_ADMIN_LISTEN; both win over this file.
+  listen: 127.0.0.1:9100
+  # Required when listen is not loopback: the admin API can replace the binaries drover runs.
+  # Also DROVER_TOKEN (which wins).
+  token: ""
+
+# Base URL of an image-file-fetch server, for releases taken out of a container image.
+# Also DROVER_IMAGE_FETCH_URL.
+image_fetch_url: ""
+
+max_binary_bytes: 1073741824
+
+# Recent lines kept in memory per app for GET /apps/<app>/logs. Everything also goes to drover's stdout.
+log_lines: 1000
+
+# A second listener that serves only GET /metrics (Prometheus format), without a token. Empty: off; the
+# metrics are still at /metrics on the admin API.
+metrics:
+  listen: ""
+
+apps:
+  - name: web
+    # A string (split like a shell would, but no shell runs it) or a list. Per instance:
+    #   {bin}    the binary of the version the instance runs
+    #   {port}   the loopback port the instance must listen on (also in $PORT)
+    #   {index}  the instance number, from 0
+    # Without {bin}, the first word is the binary that releases replace.
+    command: /usr/local/bin/web --port {port}
+    # Only needed when the binary is not the first word, e.g. command: "node {bin} --port {port}".
+    # binary: /srv/server.js
+    listen: ":8080"
+    instances: 2
+    # Instances get ports port_base .. port_base + 2*instances - 1 (a rollout runs old and new side by side).
+    port_base: 9000
+    health:
+      path: ""          # GET this path, 2xx/3xx is healthy. Empty: the port accepting a connection is enough.
+      interval: 2s
+      timeout: 2s
+    start_timeout: 30s  # how long a new instance has to become healthy before a rollout is called off
+    drain_timeout: 30s  # how long an old instance may finish its open requests
+    stop_timeout: 10s   # after stop_signal, how long until SIGKILL
+    stop_signal: TERM
+    try_duration: 5s    # how long a request waits for a healthy instance before it gets a 503
+    dir: ""
+    env:
+      LOG_LEVEL: info

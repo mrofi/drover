@@ -1,0 +1,214 @@
+# drover
+
+> drover runs a command as N supervised instances, load balances one public HTTP port across them, and
+> replaces the binary they run with a rolling, zero-downtime rollout that can be rolled back. One static
+> Linux binary, no root needed. This file is the complete reference; `drover llms` prints it.
+
+## Model
+
+- An **app** has a name, a command, a public `listen` address and N **instances**.
+- Each instance is one process on its own loopback port (`port_base`, `port_base+1`, ...). drover restarts it
+  when it exits (delay 1s, doubling to 30s).
+- The load balancer on `listen` sends each request to the healthy instance with the fewest open requests.
+- A **version** is a stored copy of the app's binary with a name you choose. `builtin` is the binary that
+  was already on disk. Exactly one version is **current**; drover also remembers the **previous** one.
+- A **rollout** switches versions one instance at a time: start the new instance on a spare port, wait until
+  it is healthy, give it the slot, let the old one finish open requests (`drain_timeout`), stop it. If a new
+  instance does not become healthy, the rollout is undone and the old version stays current.
+
+## Start the server
+
+```sh
+# one app, flags only. Everything after -- is the app's command.
+drover run --listen :8080 --instances 2 --health /health -- /usr/local/bin/app --port '{port}'
+
+# config file (several apps, timeouts, env)
+drover run -c drover.yaml
+```
+
+Flags for `drover run` without `-c`: `--name app` `--listen :8080` `--instances 2` `--port-base 9000`
+`--health ""`. With or without `-c`: `--admin 127.0.0.1:9100` `--data <dir>` `--metrics <addr>`. Config path may also come from
+`DROVER_CONFIG`, else `./drover.yaml`, else `/etc/drover.yaml`. The admin address may also come from
+`DROVER_ADMIN_LISTEN` (order: `--admin`, then the variable, then the config file).
+
+drover runs in the foreground and logs to stdout. Instance output is prefixed `[app#0]`. SIGTERM or SIGINT
+stops every instance, then drover.
+
+### Writing the command
+
+- `{port}` → the instance's port. Also exported as `$PORT`. `{index}` → instance number from 0. `{bin}` →
+  path of the binary of the version the instance runs.
+- If the command has no `{bin}`, its first word is the binary that versions replace.
+- No shell runs the command: no `VAR=x cmd`, pipes, `&&`, globbing or `$VAR` expansion. Set variables with
+  `env:` in the config. Need a shell? Use `sh -c '...'` as the command and set `binary:` yourself.
+- In a shell, quote `'{port}'`.
+- The app must listen on 127.0.0.1 or 0.0.0.0 at that port, speak HTTP/1.1, and must not take a fixed port
+  from anywhere else (an env file that sets PORT makes all instances collide and crash-loop).
+- Instances also get `DROVER_APP`, `DROVER_INDEX`, `DROVER_VERSION`. They do not get `DROVER_TOKEN`.
+
+| Before | With drover |
+|---|---|
+| `myapp --port 3000` | `drover run --listen :3000 -- myapp --port '{port}'` |
+| `PORT=3000 myapp --env /etc/myapp.env` | `drover run --listen :3000 -- myapp --env /etc/myapp.env` |
+| `node /srv/server.js` (reads $PORT) | config: `command: node {bin}`, `binary: /srv/server.js` |
+
+### Config file
+
+Only `name`, `command`, `listen` are required. Unknown keys are an error. Values shown are the defaults.
+
+```yaml
+data: /home/app/.local/share/drover   # default $HOME/.local/share/drover; env DROVER_DATA; no ~ expansion
+admin:
+  listen: 127.0.0.1:9100              # flag --admin or env DROVER_ADMIN_LISTEN win
+  token: ""                           # env DROVER_TOKEN wins. Required when listen is not loopback.
+image_fetch_url: ""                   # env DROVER_IMAGE_FETCH_URL. Needed only for image sources.
+max_binary_bytes: 1073741824
+log_lines: 1000                       # recent lines kept in memory per app for the logs endpoint
+metrics:
+  listen: ""                          # e.g. ":9101": extra listener serving only /metrics, no token
+apps:
+  - name: web                         # letters, digits, . _ -  (max 64)
+    command: /usr/local/bin/web --port {port}   # string or YAML list
+    binary: ""                        # default: first word of command
+    listen: ":8080"
+    instances: 1                      # (the --instances flag defaults to 2)
+    port_base: 9000                   # uses port_base .. port_base+2*instances-1; apps must not overlap
+    health:
+      path: ""                        # GET, 2xx/3xx = healthy. Empty = TCP connect to the port.
+      interval: 2s
+      timeout: 2s
+    start_timeout: 30s                # a new instance must be healthy within this or the rollout is undone
+    drain_timeout: 30s                # how long an old instance may finish open requests / WebSockets
+    stop_timeout: 10s                 # after stop_signal, time until SIGKILL
+    stop_signal: TERM                 # TERM INT QUIT HUP KILL USR1 USR2
+    try_duration: 5s                  # how long a request waits for a healthy instance before 503
+    dir: ""                           # working directory
+    env: {}                           # extra environment variables
+```
+
+## Control a running drover
+
+Client commands talk to the admin API at `DROVER_ADMIN` (a URL, default `http://127.0.0.1:9100`; set it
+when the server's address was changed, it does not follow `DROVER_ADMIN_LISTEN`) and send
+`DROVER_TOKEN` when set. They print the JSON response and exit 0, or print the error to stderr and exit 1.
+Positional arguments come before flags. Commands that roll out block until the rollout is over.
+
+| Goal | CLI | HTTP |
+|---|---|---|
+| Status of all apps | `drover status` | `GET /apps` |
+| Status of one app | `drover status <app>` | `GET /apps/<app>` |
+| List versions | `drover releases <app>` | `GET /apps/<app>/releases` |
+| Read app output | `drover logs <app> [-f] [--tail n] [--instance n]` | `GET /apps/<app>/logs?tail=n&instance=n&follow=true` |
+| Prometheus metrics | `drover metrics` | `GET /metrics` |
+| Add a version from a file | `drover upload <app> <file> --version <v>` | `PUT /apps/<app>/releases/<v>` (body = the file; `curl -T file URL`) |
+| Add a version from a URL | `drover fetch <app> --url <url> --version <v>` | `POST /apps/<app>/releases` `{"url":"...","version":"v"}` |
+| Add a version from a container image | `drover fetch <app> --image <ref> --path </file> --version <v>` | `POST /apps/<app>/releases` `{"image":"...","path":"...","version":"v"}` |
+| Switch to a version | `drover activate <app> <v>` | `POST /apps/<app>/releases/<v>/activate` |
+| Switch to the previous version | `drover rollback <app>` | `POST /apps/<app>/rollback` |
+| Rolling restart, same version | `drover restart <app>` | `POST /apps/<app>/restart` |
+| Delete a version | `drover rm <app> <v>` | `DELETE /apps/<app>/releases/<v>` |
+| Is drover up (no token needed) | | `GET /healthz` |
+
+Adding a version also switches to it. To only store it: `--no-activate`, `"activate": false`, or
+`?activate=false` on the PUT. Optional checksum: `--sha256 <hex>`, `"sha256"`, or `?sha256=`. Without a
+version name, fetch and `drover upload` use a UTC timestamp like `20261116-154400`. Private image:
+`--username`/`--password` or `"username"`/`"password"`. Version names: letters, digits, `.` `_` `-`, max 64,
+not `builtin`. A name cannot be reused; delete it first.
+
+### Logs
+
+Plain text, one line per line of output, oldest first: `<RFC3339 time> [<app>#<instance>] <line>`. Lines
+without `#<instance>` are drover's own events about the app (rollouts, exits). Default `tail` is 200; the
+buffer holds the last `log_lines` (1000) per app, stdout and stderr merged, and is empty after drover
+restarts. `follow=true` keeps the response open (`curl -N`). Full history is in drover's stdout
+(`docker logs`), where the same lines appear as `[app#0] line`.
+
+### Metrics
+
+Prometheus text format at `GET /metrics` on the admin API (token applies) and, when `metrics.listen` or
+`--metrics` is set, on that address without a token. Series: `drover_requests_total{app,code}`,
+`drover_request_duration_seconds{app}` (histogram), `drover_retries_total{app}`,
+`drover_instance_exits_total{app}`, `drover_rollouts_total{app,result="success"|"failed"}`,
+`drover_instances{app}`, `drover_healthy_instances{app}`, `drover_inflight_requests{app,instance}`,
+`drover_rollout_in_progress{app}`, `drover_version_info{app,version}`, `drover_build_info{version}`.
+Code `499` = client went away, `101` = upgraded connection. Counters reset when drover restarts.
+
+### Responses
+
+| Code | Meaning |
+|---|---|
+| 200 | Done. Body is the app status (or the list). |
+| 201 | Version stored, not activated. Body is the release. |
+| 204 | Deleted. |
+| 400 | Bad request: invalid version name, bad JSON, empty or too large binary, sha256 mismatch. |
+| 401 | Missing or wrong token. Send `X-Drover-Token: <token>` (use this behind a proxy that owns `Authorization`) or `Authorization: Bearer <token>`. If `X-Drover-Token` is present, only it is checked. |
+| 404 | No such app or version. |
+| 409 | Version name already exists; another rollout of this app is running; no previous version to roll back to; tried to delete the current version or `builtin`. |
+| 500 | Rollout failed and was undone. The app is still on the version from before. A version that was just added stays stored. When the new binary exited, the message ends with its last output lines. |
+| 502 | drover could not download the URL or image file. Nothing was stored. |
+
+Errors are `{"message": "..."}`.
+
+Status body:
+
+```json
+{"name":"web","listen":"[::]:8080","version":"v2","previous":"v1","rolling":false,
+ "instances":[{"slot":0,"port":9000,"pid":123,"version":"v2","state":"healthy","inflight":0,"restarts":0,
+               "started":"2026-11-16T15:44:00Z"}]}
+```
+
+Instance `state`: `healthy` (gets traffic), `unhealthy` (running, failing its check), `down` (exited, waiting
+to restart), `draining` (old instance finishing requests), `empty` (no binary to run yet). `restarts` counts
+exits of that instance since it was started.
+
+Release entry: `{"version","size","sha256","source","created","current"}`.
+
+## Recipes
+
+Deploy a new build and confirm it:
+
+```sh
+drover upload web ./build/web --version "$(git rev-parse --short HEAD)" || echo "rollout failed, old version still serving"
+drover status web          # every instance: "state":"healthy", "version": the new one
+drover logs web --tail 20  # what the new instances printed
+```
+
+Roll back: `drover rollback web`. To a specific one: `drover releases web`, then `drover activate web <v>`.
+
+Start with no binary and deploy later: use `command: "{bin} --port {port}"` with no `binary:`. Requests get
+503 until the first `drover upload`.
+
+In a Dockerfile:
+
+```dockerfile
+COPY --from=ghcr.io/mrofi/drover:latest /drover /usr/local/bin/drover
+USER 1000
+CMD ["drover", "run", "--listen", ":8080", "--instances", "3", "--", "app", "--port", "{port}"]
+```
+
+Read-only root filesystem: set `DROVER_DATA` to a writable mount that allows execution.
+
+## Diagnose
+
+| Symptom | Cause and fix |
+|---|---|
+| 503 `no healthy instance` | No instance is healthy. `drover status <app>`, then `drover logs <app>`. |
+| Instances `down`, `restarts` climbing | The command exits. Usual causes: wrong flag, `{port}` unquoted in a shell, a fixed port so instances collide, binary not executable or built for another libc/arch. |
+| Instances `unhealthy` | Process runs but `health.path` does not return 2xx/3xx, or it listens on another interface or port. |
+| Upload returns 500 `keeps exiting right after start` | The new binary crashes on start. Old version still serves. The reason is in the error (`its last output:`) and in `drover logs <app>`. Fix the build; `drover rm <app> <v>` removes the bad one. |
+| Upload returns 500 `not healthy after ...` | The new binary starts too slowly or fails its health check. Raise `start_timeout` or fix the check. |
+| 409 on upload | That version name exists. Pick another or delete it. |
+| 502 `upstream error` | The instance accepted the request, then failed. Such a request is not retried. |
+| drover refuses to start: `not loopback` | `admin.listen` is on the network without a token. Set `DROVER_TOKEN`. |
+| `address already in use` at start | Something else has the `listen` or admin port. |
+| Version back to `builtin` after a container restart | The data directory is not on a volume. |
+
+## Limits
+
+- HTTP/1.1 to instances only. No TLS, no raw TCP, no sticky sessions.
+- WebSockets work. A rollout closes connections still open on an old instance after `drain_timeout`;
+  clients must reconnect.
+- The instance count cannot change while running: change the config and restart drover.
+- Version names are fixed; there are no movable aliases such as `stable`.
+- The admin API can replace running binaries. Keep it on loopback or behind a token.
+- Do not stop or restart the `drover` process to deploy; use the commands above.

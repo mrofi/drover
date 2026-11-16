@@ -1,0 +1,67 @@
+name: publish
+# Publishes the image to GitHub Container Registry and the binaries to a GitHub release.
+#   push a tag v1.2.3 -> image :1.2.3, :1.2, :1 and :latest, and a release with drover-linux-amd64 / -arm64.
+#   "Run workflow" (manual) -> builds and pushes the branch as :edge. No release.
+# Nothing is published by a plain push.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/drover
+          tags: |
+            type=edge,branch=${{ github.event.repository.default_branch }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          # The Go compiler cross-compiles, so arm64 needs no emulation (see the Dockerfile).
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ github.ref_name }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  binaries:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test -race -count=1 ./...
+      - name: Build
+        run: |
+          mkdir dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/drover-linux-$arch .
+          done
+          cd dist && sha256sum drover-linux-* > SHA256SUMS
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes

@@ -1,0 +1,41 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test -race -count=1 ./...
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t drover .
+      - name: The image runs
+        run: docker run --rm drover version
+      - name: Injected into another image, as uid 1000 on a read-only root filesystem
+        run: |
+          docker build -f examples/inject/Dockerfile -t drover-inject .
+          docker run -d --name inject --read-only --tmpfs /tmp:exec --cap-drop ALL -p 127.0.0.1:18080:8080 drover-inject
+          for _ in $(seq 1 30); do
+            curl -fs 127.0.0.1:18080/ && break
+            sleep 1
+          done
+          curl -fs 127.0.0.1:18080/
+          docker exec inject drover restart app
+          curl -fs 127.0.0.1:18080/
+          docker logs inject

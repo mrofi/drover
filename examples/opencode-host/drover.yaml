@@ -1,0 +1,8 @@
+# The app has no binary in the image: drover starts empty and runs it once a first release is uploaded.
+data: /home/node/.local/share/drover
+apps:
+  - name: web
+    command: "{bin} --port {port}"
+    listen: ":8090"
+    instances: 2
+    port_base: 9000
