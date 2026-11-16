@@ -27,7 +27,7 @@ drover run -c drover.yaml
 ```
 
 Flags for `drover run` without `-c`: `--name app` `--listen :8080` `--instances 2` `--port-base 9000`
-`--health ""`. With or without `-c`: `--admin 127.0.0.1:9100` `--data <dir>` `--metrics <addr>`. Config path may also come from
+`--health ""` `--env-file ""`. With or without `-c`: `--admin 127.0.0.1:9100` `--data <dir>` `--metrics <addr>`. Config path may also come from
 `DROVER_CONFIG`, else `./drover.yaml`, else `/etc/drover.yaml`. The admin address may also come from
 `DROVER_ADMIN_LISTEN` (order: `--admin`, then the variable, then the config file).
 
@@ -40,7 +40,7 @@ stops every instance, then drover.
   path of the binary of the version the instance runs.
 - If the command has no `{bin}`, its first word is the binary that versions replace.
 - No shell runs the command: no `VAR=x cmd`, pipes, `&&`, globbing or `$VAR` expansion. Set variables with
-  `env:` in the config. Need a shell? Use `sh -c '...'` as the command and set `binary:` yourself.
+  `env:` or `env_file:` in the config (see Environment). Need a shell? Use `sh -c '...'` as the command and set `binary:` yourself.
 - In a shell, quote `'{port}'`.
 - The app must listen on 127.0.0.1 or 0.0.0.0 at that port, speak HTTP/1.1, and must not take a fixed port
   from anywhere else (an env file that sets PORT makes all instances collide and crash-loop).
@@ -84,6 +84,7 @@ apps:
     try_duration: 5s                  # how long a request waits for a healthy instance before 503
     dir: ""                           # working directory
     env: {}                           # extra environment variables
+    env_file: ""                      # KEY=VALUE file read at each instance start; wins over env
 ```
 
 ## Control a running drover
@@ -100,6 +101,11 @@ Positional arguments come before flags. Commands that roll out block until the r
 | List versions | `drover releases <app>` | `GET /apps/<app>/releases` |
 | Read app output | `drover logs <app> [-f] [--tail n] [--instance n]` | `GET /apps/<app>/logs?tail=n&instance=n&follow=true` |
 | Prometheus metrics | `drover metrics` | `GET /metrics` |
+| Variable names by source | `drover env <app>` | `GET /apps/<app>/env` |
+| Set/remove in-memory overrides | `drover env set <app> K=V...` / `drover env unset <app> K...` | `PATCH /apps/<app>/env` `{"set":{"K":"V"},"unset":["K"]}` |
+| Drop all overrides | `drover env clear <app>` | `DELETE /apps/<app>/env` |
+| Edit variables in the env file | `drover env set <app> --file K=V...` / `drover env unset <app> --file K...` | `PATCH /apps/<app>/env/file` (same JSON) |
+| Replace the env file | `drover env put <app> <file>` | `PUT /apps/<app>/env/file` (body = the file) |
 | Add a version from a file | `drover upload <app> <file> --version <v>` | `PUT /apps/<app>/releases/<v>` (body = the file; `curl -T file URL`) |
 | Add a version from a URL | `drover fetch <app> --url <url> --version <v>` | `POST /apps/<app>/releases` `{"url":"...","version":"v"}` |
 | Add a version from a container image | `drover fetch <app> --image <ref> --path </file> --version <v>` | `POST /apps/<app>/releases` `{"image":"...","path":"...","version":"v"}` |
@@ -114,6 +120,33 @@ Adding a version also switches to it. To only store it: `--no-activate`, `"activ
 version name, fetch and `drover upload` use a UTC timestamp like `20261116-154400`. Private image:
 `--username`/`--password` or `"username"`/`"password"`. Version names: letters, digits, `.` `_` `-`, max 64,
 not `builtin`. A name cannot be reused; delete it first.
+
+### Environment
+
+Layers, later wins: (1) drover's own environment minus `DROVER_TOKEN`, (2) config `env:`, (3) the app's
+`env_file`, read at each instance start, (4) overrides set through the API, in memory only and lost when
+drover restarts, (5) `PORT`, `DROVER_APP`, `DROVER_INDEX`, `DROVER_VERSION`, always set by drover and not
+changeable.
+
+- Every env call does a rolling restart and returns when it is over. If the instances do not come up, the
+  change is undone (file content or overrides restored), the old instances keep serving, and the answer is
+  500 with the new instances' last output.
+- `--no-restart` / `?restart=false` stores the change only: it is not tried and not undone. The next
+  rollout of any kind uses it; if it is bad, that rollout (even of a new binary) fails with a
+  `note: the app's environment was changed...` line, and keeps failing until the variable is fixed.
+- `"pending": true` in `GET /apps/<app>/env` and `"env_pending": true` in the status mean the stored
+  environment is not what the instances run with (stored without restart, or the file was edited by hand).
+  `drover restart <app>` applies it.
+- A hand-edited `env_file` takes effect at the next `drover restart <app>` or rollout, not on a crash restart.
+- Values are never returned: `GET /apps/<app>/env` gives
+  `{"env_file","file":[names],"overrides":[names],"config":[names],"reserved":[names]}`; status has
+  `"env_overrides":[names]`.
+- File format: `KEY=VALUE` lines, `#` comment lines, optional `export `, values optionally in single quotes
+  (literal) or double quotes (`\n` `\"` `\\` unescaped). No `$VAR` expansion, no trailing comments. A
+  missing file is empty; an unparsable one fails the rollout. PATCH keeps comments and other lines.
+- To make a setting last: put it in the file (`--file`). To try something now: an override.
+- Codes: 400 bad name, reserved name, empty change or unparsable file; 409 no `env_file` configured or a
+  rollout is running; 500 change undone, or the file is not writable.
 
 ### Logs
 
@@ -130,7 +163,7 @@ Prometheus text format at `GET /metrics` on the admin API (token applies) and, w
 `drover_request_duration_seconds{app}` (histogram), `drover_retries_total{app}`,
 `drover_instance_exits_total{app}`, `drover_rollouts_total{app,result="success"|"failed"}`,
 `drover_instances{app}`, `drover_healthy_instances{app}`, `drover_inflight_requests{app,instance}`,
-`drover_rollout_in_progress{app}`, `drover_version_info{app,version}`, `drover_build_info{version}`.
+`drover_rollout_in_progress{app}`, `drover_env_pending{app}`, `drover_version_info{app,version}`, `drover_build_info{version}`.
 Code `499` = client went away, `101` = upgraded connection. Counters reset when drover restarts.
 
 ### Responses
@@ -202,6 +235,9 @@ Read-only root filesystem: set `DROVER_DATA` to a writable mount that allows exe
 | drover refuses to start: `not loopback` | `admin.listen` is on the network without a token. Set `DROVER_TOKEN`. |
 | `address already in use` at start | Something else has the `listen` or admin port. |
 | Version back to `builtin` after a container restart | The data directory is not on a volume. |
+| A rollout fails with `note: the app's environment was changed` | A variable stored earlier with `--no-restart` (or a hand-edited env file) is being used for the first time. Check `drover env <app>` and `drover logs <app>`, fix the variable, roll out again. |
+| A variable set with `drover env set` is gone | It was an override and drover restarted. Use `--file`, or `env:` in the config. |
+| Changed the env file by hand, app still has old values | Run `drover restart <app>`. |
 
 ## Limits
 
@@ -211,4 +247,5 @@ Read-only root filesystem: set `DROVER_DATA` to a writable mount that allows exe
 - The instance count cannot change while running: change the config and restart drover.
 - Version names are fixed; there are no movable aliases such as `stable`.
 - The admin API can replace running binaries. Keep it on loopback or behind a token.
-- Do not stop or restart the `drover` process to deploy; use the commands above.
+- Rolling back a version does not roll back variables.
+- Do not stop or restart the `drover` process to deploy or to change variables; use the commands above.

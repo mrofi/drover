@@ -35,6 +35,8 @@ func runClient(cmd string, args []string) error {
 			return call(http.MethodGet, "/apps", nil, "")
 		}
 		return call(http.MethodGet, "/apps/"+app, nil, "")
+	case "env":
+		return runEnv(args)
 	case "logs":
 		if err := need(1, "<app> [-f] [--tail n] [--instance n]"); err != nil {
 			return err
@@ -125,6 +127,77 @@ func runClient(cmd string, args []string) error {
 		return call(http.MethodPut, "/apps/"+app+"/releases/"+url.PathEscape(*ver)+"?"+q.Encode(), f, "application/octet-stream")
 	}
 	return fmt.Errorf("unknown command %q (try `drover help`)", cmd)
+}
+
+// runEnv implements `drover env ...`. Flags may come anywhere after the subcommand.
+func runEnv(all []string) error {
+	var args []string
+	file, restart := false, true
+	for _, a := range all {
+		switch a {
+		case "--file", "-file":
+			file = true
+		case "--no-restart", "-no-restart":
+			restart = false
+		default:
+			args = append(args, a)
+		}
+	}
+	usage := errors.New("usage: drover env <app> | env set <app> KEY=VALUE... [--file] | env unset <app> KEY... [--file] | env clear <app> | env put <app> <file>   (all but the first take --no-restart)")
+	if len(args) == 0 {
+		return usage
+	}
+	sub := ""
+	if len(args) >= 2 {
+		switch args[0] {
+		case "set", "unset", "clear", "put":
+			sub, args = args[0], args[1:]
+		}
+	}
+	path := "/apps/" + url.PathEscape(args[0]) + "/env"
+	q := ""
+	if !restart {
+		q = "?restart=false"
+	}
+	switch sub {
+	case "":
+		if len(args) != 1 {
+			return usage
+		}
+		return call(http.MethodGet, path, nil, "")
+	case "clear":
+		return call(http.MethodDelete, path+q, nil, "")
+	case "put":
+		if len(args) != 2 {
+			return usage
+		}
+		f, err := os.Open(args[1])
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		return call(http.MethodPut, path+"/file"+q, f, "text/plain")
+	}
+	if len(args) < 2 {
+		return usage
+	}
+	change := envChange{Set: map[string]string{}}
+	for _, kv := range args[1:] {
+		if sub == "unset" {
+			change.Unset = append(change.Unset, kv)
+			continue
+		}
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			return fmt.Errorf("%q is not KEY=VALUE", kv)
+		}
+		change.Set[k] = v
+	}
+	if file {
+		path += "/file"
+	}
+	body, _ := json.Marshal(change)
+	return call(http.MethodPatch, path+q, bytes.NewReader(body), "application/json")
 }
 
 func call(method, path string, body io.Reader, contentType string) error {

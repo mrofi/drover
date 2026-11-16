@@ -15,7 +15,14 @@ var version = "v1"
 func main() {
 	port := flag.String("port", os.Getenv("PORT"), "port")
 	flag.Parse()
+	if os.Getenv("FAKEAPP_FAIL") != "" {
+		fmt.Println("fakeapp: FAKEAPP_FAIL is set, exiting")
+		os.Exit(1)
+	}
 	fmt.Println("fakeapp", version, "listening on", *port)
+	http.HandleFunc("/env", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, os.Getenv(r.URL.Query().Get("name")))
+	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%s %s %d\n", version, *port, os.Getpid())
 	})

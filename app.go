@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,13 +27,14 @@ type App struct {
 	logs         *logBuffer
 	metrics      *appMetrics
 
-	mu       sync.RWMutex
-	slots    []*proc        // the instance serving each slot; nil while a slot has nothing to run
-	procs    map[*proc]bool // every live proc, including ones being started or drained
-	ports    map[int]bool   // instance ports in use
-	version  string         // version the slots run (or are being rolled back to)
-	previous string
-	closed   bool
+	mu        sync.RWMutex
+	slots     []*proc        // the instance serving each slot; nil while a slot has nothing to run
+	procs     map[*proc]bool // every live proc, including ones being started or drained
+	ports     map[int]bool   // instance ports in use
+	version   string         // version the slots run (or are being rolled back to)
+	previous  string
+	closed    bool
+	overrides map[string]string // variables set through the API, in memory only
 
 	rollMu  sync.Mutex
 	rolling atomic.Bool
@@ -115,6 +117,12 @@ func (a *App) spawn(slot int, version string) (*proc, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Read here, once per instance: a restart after a crash reuses what the instance was started with, so
+	// an edited file takes effect only through a rollout, where a bad value can be undone.
+	fileVars, _, err := a.readEnvFile()
+	if err != nil {
+		return nil, err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closed {
@@ -135,7 +143,7 @@ func (a *App) spawn(slot int, version string) (*proc, error) {
 	for i, w := range a.cfg.Command {
 		argv[i] = repl.Replace(w)
 	}
-	p := newProc(a, slot, port, version, argv)
+	p := newProc(a, slot, port, version, argv, a.instanceEnv(fileVars))
 	a.ports[port] = true
 	a.procs[p] = true
 	go p.run()
@@ -205,6 +213,13 @@ func (a *App) rollout(target string) error {
 		return errBusy
 	}
 	defer a.rollMu.Unlock()
+	return a.rolloutLocked(target, true)
+}
+
+// rolloutLocked is rollout for callers that already hold rollMu. With envHint, a failure while an
+// environment change was waiting to be applied says so: the cause may be a variable, not the binary.
+func (a *App) rolloutLocked(target string, envHint bool) error {
+	envHint = envHint && a.envPending()
 	a.rolling.Store(true)
 	defer a.rolling.Store(false)
 
@@ -227,7 +242,11 @@ func (a *App) rollout(target string) error {
 			}
 		}
 		a.metrics.rolloutsFail.Add(1)
-		return fmt.Errorf("instance %d on version %s: %w", i, target, err)
+		err = fmt.Errorf("instance %d on version %s: %w", i, target, err)
+		if envHint {
+			err = fmt.Errorf("%w\nnote: the app's environment was changed since the running instances started and this rollout was the first to use it, so the cause may be a variable and not the binary (see `drover env %s`)", err, a.cfg.Name)
+		}
+		return err
 	}
 	a.mu.Lock()
 	if target != old {
@@ -344,19 +363,29 @@ type InstanceStatus struct {
 }
 
 type AppStatus struct {
-	Name      string           `json:"name"`
-	Listen    string           `json:"listen"`
-	Version   string           `json:"version"`
-	Previous  string           `json:"previous,omitempty"`
-	Rolling   bool             `json:"rolling"`
-	Instances []InstanceStatus `json:"instances"`
+	Name     string `json:"name"`
+	Listen   string `json:"listen"`
+	Version  string `json:"version"`
+	Previous string `json:"previous,omitempty"`
+	Rolling  bool   `json:"rolling"`
+	// EnvPending: the stored environment differs from what the running instances were started with.
+	EnvPending bool `json:"env_pending,omitempty"`
+	// EnvOverrides are the names of variables set through the API. They are lost when drover restarts.
+	EnvOverrides []string         `json:"env_overrides,omitempty"`
+	Instances    []InstanceStatus `json:"instances"`
 }
 
 func (a *App) status() AppStatus {
+	fileVars, _, fileErr := a.readEnvFile()
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	st := AppStatus{Name: a.cfg.Name, Listen: a.cfg.Listen, Version: a.version, Previous: a.previous,
 		Rolling: a.rolling.Load()}
+	for k := range a.overrides {
+		st.EnvOverrides = append(st.EnvOverrides, k)
+	}
+	sort.Strings(st.EnvOverrides)
+	st.EnvPending = a.envPendingLocked(fileVars, fileErr)
 	if a.addr != nil {
 		st.Listen = a.addr.String()
 	}

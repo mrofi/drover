@@ -39,6 +39,7 @@ flowchart LR
 
 **Contents:** [Quick start](#quick-start) · [Moving an existing command](#moving-an-existing-command-to-drover) ·
 [Updating the binary](#updating-the-binary) · [Commands](#commands) · [Configuration](#configuration) ·
+[Environment variables](#environment-variables-of-the-app) ·
 [Adding it to an image](#adding-it-to-an-image) · [Logs](#logs) · [Metrics](#metrics) ·
 [WebSockets](#websockets-and-other-long-lived-connections) · [For AI agents](#for-ai-agents) ·
 [Security](#security) · [Limits](#what-it-does-not-do) · [Develop](#develop) · [Not tested](#not-tested)
@@ -125,9 +126,10 @@ Things that go wrong:
 - **`VAR=value` in front of the command.** No shell runs the command, so `PORT=3000 myapp` would look for a
   program named `PORT=3000`. Use `env:` in the config (or set the variable for drover itself; instances
   inherit its environment).
-- **A fixed port somewhere else.** If an env file the app loads (like `/etc/myapp.env` above) sets `PORT`
-  and wins over the real environment, or `PORT` is set under `env:`, every instance tries the same port and
-  all but one keep crashing. Remove it there.
+- **A fixed port somewhere else.** If an env file the app loads by itself (like `/etc/myapp.env` above)
+  sets `PORT` and wins over the real environment, every instance tries the same port and all but one keep
+  crashing. Remove it there. (`PORT` under `env:` or in drover's `env_file` is harmless: drover's own value
+  always wins.)
 - **Listening on another interface.** drover connects to instances on `127.0.0.1`, so the app must listen
   on `127.0.0.1` or `0.0.0.0`.
 - **No health path.** Without `--health /path` an instance counts as healthy as soon as its port accepts
@@ -183,6 +185,11 @@ The subcommands read `DROVER_ADMIN` (default `http://127.0.0.1:9100`) and `DROVE
 | Rolling restart, same version | `drover restart <app>` | `POST /apps/<app>/restart` |
 | Delete a version | `drover rm <app> <v>` | `DELETE /apps/<app>/releases/<v>` |
 | Recent output | `drover logs <app> [-f] [--tail n] [--instance n]` | `GET /apps/<app>/logs` |
+| Variable names, by source | `drover env <app>` | `GET /apps/<app>/env` |
+| Set / remove an override | `drover env set <app> K=V...`, `drover env unset <app> K...` | `PATCH /apps/<app>/env` |
+| Drop every override | `drover env clear <app>` | `DELETE /apps/<app>/env` |
+| Edit the env file | `drover env set <app> --file K=V...`, `drover env unset <app> --file K...` | `PATCH /apps/<app>/env/file` |
+| Replace the env file | `drover env put <app> <file>` | `PUT /apps/<app>/env/file` |
 | Prometheus metrics | `drover metrics` | `GET /metrics` |
 | Reference for AI agents | `drover llms` | |
 | Is drover up | | `GET /healthz` |
@@ -195,7 +202,7 @@ exit 1. Response codes and JSON shapes are in [`llms.txt`](llms.txt).
 
 `drover run` takes either flags and a command (one app), or `-c drover.yaml`
 ([every key](drover.example.yaml)). Flags, for the one-app form: `--name` `--listen` `--instances`
-`--port-base` `--health`. For both forms: `--admin` `--metrics` `--data`.
+`--port-base` `--health` `--env-file`. For both forms: `--admin` `--metrics` `--data`.
 
 | Variable | Read by | Meaning |
 |---|---|---|
@@ -229,6 +236,71 @@ An address that is not loopback (`:9500`, `0.0.0.0:9500`) needs `DROVER_TOKEN`, 
 | Metrics only | off | `--metrics`, `metrics.listen` |
 
 An app needs twice its instance count in ports because a rollout runs old and new side by side.
+
+## Environment variables of the app
+
+An instance's environment is built in layers, later ones winning:
+
+| | Source | Changed by | Survives a restart of drover |
+|---|---|---|---|
+| 1 | drover's own environment (`ENV` in the Dockerfile, `docker run -e`), without `DROVER_TOKEN` | restarting drover | yes |
+| 2 | `env:` in the config | restarting drover | yes |
+| 3 | the app's `env_file` (`--env-file`), read each time an instance is started | editing the file, or the API | yes, it is your file |
+| 4 | overrides set through the API, kept in memory | the API | **no** |
+| 5 | `PORT`, `DROVER_APP`, `DROVER_INDEX`, `DROVER_VERSION` | nobody: drover sets them | |
+
+To change variables without downtime, put them in an `env_file` and restart the instances one by one:
+
+```yaml
+apps:
+  - name: web
+    command: /usr/local/bin/web --port {port}
+    listen: ":8080"
+    env_file: /etc/web.env
+```
+
+```sh
+vi /etc/web.env && drover restart web          # edit by hand, then a rolling restart
+
+drover env set web --file LOG_LEVEL=debug      # or let drover edit the file and restart
+drover env unset web --file OLD_FLAG
+drover env put web ./web.env                   # replace the whole file
+
+drover env set web FEATURE_X=on                # an override: not written anywhere, gone when drover restarts
+drover env clear web
+drover env web                                 # which variables come from where (names only)
+```
+
+```sh
+curl -X PATCH localhost:9100/apps/web/env/file -d '{"set": {"LOG_LEVEL": "debug"}, "unset": ["OLD_FLAG"]}'
+curl -X PUT   localhost:9100/apps/web/env/file --data-binary @web.env
+curl -X PATCH localhost:9100/apps/web/env      -d '{"set": {"FEATURE_X": "on"}}'
+curl -X DELETE localhost:9100/apps/web/env
+```
+
+- **Every change is a rolling restart**, and it is undone if the instances do not come up with it: the file
+  or the overrides go back to what they were, the old instances keep serving, and the error says what the
+  new ones printed.
+- **`--no-restart` (`?restart=false`) only stores the change.** Nothing tries it, so nothing is undone:
+  the running instances keep their values, and the next rollout of any kind (a restart, a new version, a
+  rollback) is the first to use it. If the values are bad, that rollout fails and keeps failing until they
+  are fixed; its error notes that the environment had changed, so a bad variable is not mistaken for a bad
+  binary. Use it to batch several changes before one `drover restart`.
+- **Pending changes are visible.** `drover env` shows `"pending": true` and `drover status` shows
+  `"env_pending": true` while the stored environment differs from what the instances run with, which
+  includes a file edited by hand. `drover_env_pending` is the same as a metric.
+- **A variable changes only through a rollout.** An instance restarted after a crash gets the environment
+  it was created with, so a half-edited file never reaches a running app by accident.
+- **Values are never returned.** `drover env` and `drover status` show names only. drover stores nothing:
+  the file is yours, the overrides live in memory. Do not treat overrides as configuration; put what must
+  last in the file.
+- **The file format** is `KEY=VALUE` per line, `#` comments, an optional `export`, values optionally in
+  single quotes (literal) or double quotes (`\n`, `\"`, `\\`). No `$VAR` expansion and no comments after a
+  value. Editing through the API keeps comments and other lines. A file that does not parse stops a rollout
+  rather than starting instances on half of it; a file that does not exist yet counts as empty.
+- **The file must be writable by drover** for the API to edit it (a read-only mounted secret cannot be;
+  edit it at its source and `drover restart`). A file drover creates is mode 0600.
+- **Rolling back the binary does not roll back variables.** Versions and environment are independent.
 
 ## Adding it to an image
 
@@ -310,6 +382,7 @@ curl localhost:9101/metrics
 | `drover_healthy_instances{app}` | gauge | Instances passing their health check. |
 | `drover_inflight_requests{app,instance}` | gauge | Requests open on each instance right now. |
 | `drover_rollout_in_progress{app}` | gauge | 1 while a rollout runs. |
+| `drover_env_pending{app}` | gauge | 1 while a stored environment change has not been applied by a rollout. |
 | `drover_version_info{app,version}` | gauge | The version the app is on. |
 | `drover_build_info{version}` | gauge | The drover version. |
 
@@ -346,6 +419,8 @@ drover llms
   subcommands always send `X-Drover-Token`; a proxy's basic auth can go in the URL:
   `DROVER_ADMIN=https://user:pass@admin.example.com`. With curl:
   `curl -u user:pass -H "X-Drover-Token: $DROVER_TOKEN" https://admin.example.com/apps`.
+- Whoever can call the admin API can set an app's variables and replace its env file, but cannot read
+  values back through it. (They could still deploy a binary that prints them: the admin API is full control.)
 - The logs endpoint is part of the admin API, so app output has the same protection. The separate metrics
   listener has none: it serves numbers, app names and version names to anyone who can reach it.
 - The apps do not get `DROVER_TOKEN` in their environment.
@@ -384,14 +459,13 @@ a GitHub release.
 | `proc.go` | One instance: start, restart, health check, stop. |
 | `releases.go` | Versions on disk. |
 | `admin.go` | The admin API. |
+| `env.go` | The app's environment: env file, overrides, and changing them with a rolling restart. |
 | `logs.go`, `metrics.go` | The log buffer and the Prometheus output. |
 | `llms.txt` | The agent reference, embedded in the binary. |
 
 ## Not tested
 
 - **arm64.** The image and the release binary are built for it, but drover has only been run on amd64.
-- **The workflows on GitHub.** Their steps were run locally; the workflows themselves have not run yet, and
-  the image and release they publish do not exist until a first tag is pushed.
 - **A real WebSocket library.** The test uses a bare protocol upgrade with an echo, not framed WebSocket
   traffic from a client library.
 - **A real image-file-fetch server.** Image sources are tested against a stand-in that answers
@@ -405,6 +479,8 @@ a GitHub release.
   through the HTTP API; the other subcommands were run by hand without a token.
 - **The subcommands through a proxy with its own login.** The server accepting `X-Drover-Token` beside
   another `Authorization` is tested; `DROVER_ADMIN=https://user:pass@host` was not run against a real proxy.
+- **A mounted, read-only env file.** The "not writable" answer is not tested, nor is an env file that is a
+  single bind-mounted file or a Kubernetes secret.
 - **`DROVER_ADMIN_LISTEN` in the test suite.** Its order against the flag and the config was checked by
   hand only.
 - **A volume on the data directory in a container.** Keeping the version across a restart of drover is
@@ -419,9 +495,13 @@ a GitHub release.
   three rollouts under load with no failed request, rollback, a binary that exits (rollout undone, old
   version still serving, its output in the error), URL and image sources with checksum, the version
   surviving a restart of drover, starting with no binary, the admin token, a protocol upgrade through a
-  rollout, the logs endpoint (tail, one instance, follow), and the metrics on both listeners.
+  rollout, the logs endpoint (tail, one instance, follow), the metrics on both listeners, and the app
+  environment (layers, file edits through the API, overrides, a failing change being undone, a change
+  stored without a restart showing as pending and failing the next rollout with a note).
+- On GitHub: CI and the publish workflow ran for `v0.1.0`; the amd64 release binary and the image were
+  downloaded and run.
 - By hand: uploads with `curl -T` and `wget --method=PUT`; `curl` on the logs and metrics endpoints;
-  `drover status`, `releases`, `upload`, `rollback`, `restart` and `logs`; `--admin` and
+  `drover status`, `releases`, `upload`, `rollback`, `restart`, `logs` and `env`; `--admin` and
   `DROVER_ADMIN_LISTEN`; the `examples/inject` image as uid 1000 on a read-only root filesystem with all
   capabilities dropped; the `examples/opencode-host` image (boot hook, first release, rollout under load,
   rollback, crash restart, shutdown hook).

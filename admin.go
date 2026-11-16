@@ -46,6 +46,43 @@ func (d *Drover) adminRoutes(e *echo.Echo) {
 	}))
 	g.GET("/metrics", d.metricsHandler)
 	g.GET("/apps/:app/logs", d.withApp(d.logsHandler))
+	g.GET("/apps/:app/env", d.withApp(func(c echo.Context, a *App) error {
+		return c.JSON(http.StatusOK, a.envStatus())
+	}))
+	// Overrides: in memory, lost when drover restarts.
+	g.PATCH("/apps/:app/env", d.withApp(func(c echo.Context, a *App) error {
+		change, err := readEnvChange(c)
+		if err != nil {
+			return err
+		}
+		return envResult(c, a, a.setOverrides(change, false, restartWanted(c)))
+	}))
+	g.DELETE("/apps/:app/env", d.withApp(func(c echo.Context, a *App) error {
+		return envResult(c, a, a.setOverrides(envChange{}, true, restartWanted(c)))
+	}))
+	// The env file: PUT replaces it with the request body, PATCH edits single variables.
+	g.PUT("/apps/:app/env/file", d.withApp(func(c echo.Context, a *App) error {
+		body, err := io.ReadAll(io.LimitReader(c.Request().Body, 1<<20+1))
+		if err != nil || len(body) > 1<<20 {
+			return echo.NewHTTPError(http.StatusBadRequest, "the env file must be readable and at most 1 MiB")
+		}
+		if _, _, err := parseEnv(body); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+		return envResult(c, a, a.writeEnvFile(restartWanted(c), func([]byte) ([]byte, error) { return body, nil }))
+	}))
+	g.PATCH("/apps/:app/env/file", d.withApp(func(c echo.Context, a *App) error {
+		change, err := readEnvChange(c)
+		if err != nil {
+			return err
+		}
+		return envResult(c, a, a.writeEnvFile(restartWanted(c), func(current []byte) ([]byte, error) {
+			if _, _, err := parseEnv(current); err != nil {
+				return nil, fmt.Errorf("the current env_file cannot be edited (replace it with PUT): %w", err)
+			}
+			return editEnv(current, change), nil
+		}))
+	}))
 	g.POST("/apps/:app/restart", d.withApp(func(c echo.Context, a *App) error {
 		current, _ := a.versions()
 		return d.activate(c, a, current)
@@ -78,6 +115,34 @@ func (d *Drover) adminRoutes(e *echo.Echo) {
 		a.forgetPrevious(version)
 		return c.NoContent(http.StatusNoContent)
 	}))
+}
+
+func restartWanted(c echo.Context) bool { return c.QueryParam("restart") != "false" }
+
+func readEnvChange(c echo.Context) (envChange, error) {
+	var change envChange
+	if err := json.NewDecoder(c.Request().Body).Decode(&change); err != nil {
+		return change, echo.NewHTTPError(http.StatusBadRequest, "the body must be JSON: "+err.Error())
+	}
+	if err := change.validate(); err != nil {
+		return change, echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	return change, nil
+}
+
+// envResult answers an environment change with the variable names by source, or the reason it failed.
+func envResult(c echo.Context, a *App, err error) error {
+	switch {
+	case err == nil:
+		return c.JSON(http.StatusOK, a.envStatus())
+	case errors.Is(err, errBusy), errors.Is(err, errNoEnvFile):
+		return echo.NewHTTPError(http.StatusConflict, err.Error())
+	case errors.Is(err, errRolledBack):
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	case strings.Contains(err.Error(), "not writable"):
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 }
 
 func (d *Drover) metricsHandler(c echo.Context) error {

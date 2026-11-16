@@ -28,6 +28,7 @@ type proc struct {
 	port    int
 	version string
 	argv    []string
+	env     []string // config, env_file and overrides, as they were when the instance was created
 
 	healthy  atomic.Bool
 	draining atomic.Bool
@@ -46,8 +47,8 @@ type proc struct {
 
 type proxyErrKey struct{}
 
-func newProc(app *App, slot, port int, version string, argv []string) *proc {
-	p := &proc{app: app, slot: slot, port: port, version: version, argv: argv,
+func newProc(app *App, slot, port int, version string, argv, env []string) *proc {
+	p := &proc{app: app, slot: slot, port: port, version: version, argv: argv, env: env,
 		stop: make(chan struct{}), done: make(chan struct{})}
 	target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}
 	p.proxy = &httputil.ReverseProxy{
@@ -132,11 +133,10 @@ func (p *proc) command() *exec.Cmd {
 			cmd.Env = append(cmd.Env, kv)
 		}
 	}
+	cmd.Env = append(cmd.Env, p.env...)
+	// Last, so nothing above can give two instances the same port.
 	cmd.Env = append(cmd.Env, "PORT="+strconv.Itoa(p.port), "DROVER_APP="+cfg.Name,
 		"DROVER_INDEX="+strconv.Itoa(p.slot), "DROVER_VERSION="+p.version)
-	for k, v := range cfg.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
 	out := &prefixWriter{prefix: "[" + p.label() + "] ", p: p}
 	cmd.Stdout, cmd.Stderr = out, out
 	// Its own process group, so stopping it also stops anything it started.

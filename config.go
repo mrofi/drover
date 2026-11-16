@@ -59,7 +59,9 @@ type AppConfig struct {
 	TryDuration  time.Duration     `yaml:"try_duration"`
 	StopSignal   string            `yaml:"stop_signal"`
 	Env          map[string]string `yaml:"env"`
-	Dir          string            `yaml:"dir"`
+	// EnvFile is a KEY=VALUE file read every time an instance is started. It wins over Env.
+	EnvFile string `yaml:"env_file"`
+	Dir     string `yaml:"dir"`
 
 	stopSignal syscall.Signal
 }
@@ -245,6 +247,11 @@ func (a *AppConfig) normalize(index int) error {
 			a.Command = append(Command{"{bin}"}, a.Command[1:]...)
 		} else {
 			return errors.New("binary is set but command has no {bin} placeholder")
+		}
+	}
+	if a.EnvFile != "" {
+		if abs, err := filepath.Abs(a.EnvFile); err == nil {
+			a.EnvFile = abs
 		}
 	}
 	if a.Binary != "" {

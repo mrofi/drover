@@ -131,6 +131,13 @@ func (d *Drover) writeMetrics(w io.Writer) {
 		return 0
 	})
 
+	gauge("drover_env_pending", "1 while a stored environment change has not been applied by a rollout yet.", func(st AppStatus) int {
+		if st.EnvPending {
+			return 1
+		}
+		return 0
+	})
+
 	head("drover_inflight_requests", "gauge", "Requests open on each instance right now.")
 	for _, st := range statuses {
 		for _, in := range st.Instances {

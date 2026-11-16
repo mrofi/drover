@@ -51,3 +51,6 @@ apps:
     dir: ""
     env:
       LOG_LEVEL: info
+    # KEY=VALUE file read each time an instance is started; wins over env. Change it by hand and run
+    # `drover restart web`, or through `drover env set web --file KEY=VALUE`. Empty: none.
+    env_file: ""

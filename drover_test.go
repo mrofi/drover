@@ -222,8 +222,10 @@ func TestUploadRollsOutWithoutFailedRequestsAndRollsBack(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("upload: %d %s", code, body)
 	}
-	if versions, pids := h.served(20); !versions["v2"] || len(versions) != 1 || len(pids) != 2 {
-		t.Fatalf("after upload want 2 processes on v2, got %v %v", versions, pids)
+	// Only the version is checked while the load runs: with least-connections balancing, a burst of quick
+	// requests can all go to the instance that has fewer slow ones open.
+	if versions, _ := h.served(20); !versions["v2"] || len(versions) != 1 {
+		t.Fatalf("after upload want v2, got %v", versions)
 	}
 	if st := h.status(); st.Version != "v2" || st.Previous != versionBuiltin {
 		t.Fatalf("status after upload: %+v", st)
@@ -243,6 +245,9 @@ func TestUploadRollsOutWithoutFailedRequestsAndRollsBack(t *testing.T) {
 	wg.Wait()
 	if failed.Load() != 0 || total.Load() < 20 {
 		t.Fatalf("%d of %d requests failed during three rollouts", failed.Load(), total.Load())
+	}
+	if versions, pids := h.served(20); !versions["v2"] || len(versions) != 1 || len(pids) != 2 {
+		t.Fatalf("with no other load want 2 processes on v2, got %v %v", versions, pids)
 	}
 	// No instance of an old version is left running on an instance port.
 	h.waitFor("old instances to be gone", func() bool {
@@ -591,6 +596,7 @@ func TestMetrics(t *testing.T) {
 		`drover_rollouts_total{app="web",result="success"} 1`,
 		`drover_rollouts_total{app="web",result="failed"} 1`,
 		`drover_instances{app="web"} 2`,
+		`drover_env_pending{app="web"} 0`,
 		`drover_healthy_instances{app="web"} 2`,
 		`drover_version_info{app="web",version="v2"} 1`,
 		`drover_inflight_requests{app="web",instance="0"} 0`,
@@ -612,5 +618,203 @@ func TestMetrics(t *testing.T) {
 	}
 	if code, body := h.do(http.MethodGet, "/metrics", nil); code != 200 || !strings.Contains(body, "drover_build_info") {
 		t.Fatalf("admin /metrics with the token: %d", code)
+	}
+}
+
+// envOf returns the value of a variable as an instance sees it, asked once per instance.
+func (h *harness) envOf(name string) map[string]bool {
+	h.t.Helper()
+	seen := map[string]bool{}
+	for i := 0; i < 20; i++ {
+		code, body := h.get("/env?name=" + name)
+		if code != 200 {
+			h.t.Fatalf("GET /env: %d %s", code, body)
+		}
+		seen[strings.TrimSpace(body)] = true
+	}
+	return seen
+}
+
+func TestEnvFileAndOverrides(t *testing.T) {
+	envFile := filepath.Join(t.TempDir(), "app.env")
+	os.WriteFile(envFile, []byte("# settings\nGREETING=from-file\nexport QUOTED=\"two words\"\nPORT=1\n"), 0o600)
+	h := startDrover(t, func(c *Config) {
+		c.Apps[0].EnvFile = envFile
+		c.Apps[0].Env = map[string]string{"GREETING": "from-config", "ONLY_CONFIG": "yes"}
+	})
+	one := func(name, want string) {
+		t.Helper()
+		if got := h.envOf(name); len(got) != 1 || !got[want] {
+			t.Fatalf("%s: want %q on every instance, got %v", name, want, got)
+		}
+	}
+	// The file wins over the config; PORT in the file is ignored, or the instances would not be up at all.
+	one("GREETING", "from-file")
+	one("QUOTED", "two words")
+	one("ONLY_CONFIG", "yes")
+
+	// Editing the file by hand changes nothing until a restart.
+	if h.status().EnvPending {
+		t.Fatal("env_pending right after start")
+	}
+	os.WriteFile(envFile, []byte("GREETING=edited\n"), 0o600)
+	one("GREETING", "from-file")
+	if !h.status().EnvPending {
+		t.Fatal("a hand-edited env file should show as env_pending")
+	}
+	if code, body := h.do(http.MethodPost, "/apps/web/restart", nil); code != 200 {
+		t.Fatalf("restart: %d %s", code, body)
+	}
+	one("GREETING", "edited")
+	if h.status().EnvPending {
+		t.Fatal("env_pending after the restart that applied the file")
+	}
+
+	patch := func(path, body string) (int, string) {
+		return h.do(http.MethodPatch, path, strings.NewReader(body))
+	}
+	// An override wins over the file, is in memory only, and shows up by name, never by value.
+	code, body := patch("/apps/web/env", `{"set":{"GREETING":"override","SECRET":"hunter2"}}`)
+	if code != 200 || strings.Contains(body, "hunter2") || !strings.Contains(body, `"overrides":["GREETING","SECRET"]`) {
+		t.Fatalf("set override: %d %s", code, body)
+	}
+	one("GREETING", "override")
+	one("SECRET", "hunter2")
+	if st := h.status(); fmt.Sprint(st.EnvOverrides) != "[GREETING SECRET]" {
+		t.Fatalf("status lacks the override names: %+v", st.EnvOverrides)
+	}
+	if raw, _ := os.ReadFile(envFile); strings.Contains(string(raw), "hunter2") {
+		t.Fatal("an override was written to the env file")
+	}
+	if _, err := os.Stat(filepath.Join(h.d.cfg.Data, "web", "env")); err == nil {
+		t.Fatal("overrides were stored in the data directory")
+	}
+	if code, body := patch("/apps/web/env", `{"unset":["GREETING"]}`); code != 200 {
+		t.Fatalf("unset override: %d %s", code, body)
+	}
+	one("GREETING", "edited")
+	one("SECRET", "hunter2")
+
+	// Editing the file through the API: comments and other lines stay.
+	os.WriteFile(envFile, []byte("# keep me\nGREETING=edited\nOLD=1\n"), 0o600)
+	if code, body := patch("/apps/web/env/file", `{"set":{"GREETING":"via api","NEW":"x"},"unset":["OLD"]}`); code != 200 {
+		t.Fatalf("patch file: %d %s", code, body)
+	}
+	if raw, _ := os.ReadFile(envFile); string(raw) != "# keep me\nGREETING=\"via api\"\nNEW=x\n" {
+		t.Fatalf("env file after patch: %q", raw)
+	}
+	one("GREETING", "via api")
+	one("NEW", "x")
+
+	// Replacing the whole file, without a restart: nothing changes until one.
+	if code, body := h.do(http.MethodPut, "/apps/web/env/file?restart=false", strings.NewReader("GREETING=replaced\n")); code != 200 {
+		t.Fatalf("put file: %d %s", code, body)
+	}
+	one("GREETING", "via api")
+	if _, body := h.do(http.MethodGet, "/apps/web/env", nil); !h.status().EnvPending || !strings.Contains(body, `"pending":true`) {
+		t.Fatalf("a change stored with restart=false should show as pending: %s", body)
+	}
+	h.do(http.MethodPost, "/apps/web/restart", nil)
+	if _, body := h.do(http.MethodGet, "/apps/web/env", nil); h.status().EnvPending || !strings.Contains(body, `"pending":false`) {
+		t.Fatalf("pending after the restart: %s", body)
+	}
+	one("GREETING", "replaced")
+	one("NEW", "")
+
+	// Clearing the overrides.
+	if code, body := h.do(http.MethodDelete, "/apps/web/env", nil); code != 200 || !strings.Contains(body, `"overrides":[]`) {
+		t.Fatalf("clear overrides: %d %s", code, body)
+	}
+	one("SECRET", "")
+
+	// Refused: reserved names, bad names, a file that does not parse.
+	for _, bad := range []string{`{"set":{"PORT":"1"}}`, `{"set":{"A B":"1"}}`, `{}`} {
+		if code, _ := patch("/apps/web/env", bad); code != 400 {
+			t.Fatalf("override %s: want 400, got %d", bad, code)
+		}
+	}
+	if code, _ := h.do(http.MethodPut, "/apps/web/env/file", strings.NewReader("not a variable\n")); code != 400 {
+		t.Fatalf("unparsable file: want 400, got %d", code)
+	}
+	if code, _ := h.do(http.MethodPut, "/apps/web/env/file", strings.NewReader("DROVER_APP=x\n")); code != 400 {
+		t.Fatalf("reserved name in the file: want 400, got %d", code)
+	}
+	one("GREETING", "replaced")
+}
+
+func TestEnvChangeIsUndoneWhenInstancesDoNotStart(t *testing.T) {
+	envFile := filepath.Join(t.TempDir(), "app.env")
+	os.WriteFile(envFile, []byte("GREETING=good\n"), 0o600)
+	h := startDrover(t, func(c *Config) { c.Apps[0].EnvFile = envFile })
+
+	// FAKEAPP_FAIL makes the test app exit at start.
+	code, body := h.do(http.MethodPatch, "/apps/web/env", strings.NewReader(`{"set":{"FAKEAPP_FAIL":"1"}}`))
+	if code != 500 || !strings.Contains(body, "change was undone") {
+		t.Fatalf("bad override: want 500, got %d %s", code, body)
+	}
+	if st := h.status(); len(st.EnvOverrides) != 0 {
+		t.Fatalf("the failed override is still set: %v", st.EnvOverrides)
+	}
+	code, body = h.do(http.MethodPatch, "/apps/web/env/file", strings.NewReader(`{"set":{"FAKEAPP_FAIL":"1"}}`))
+	if code != 500 {
+		t.Fatalf("bad file change: want 500, got %d %s", code, body)
+	}
+	if raw, _ := os.ReadFile(envFile); string(raw) != "GREETING=good\n" {
+		t.Fatalf("the env file was not put back: %q", raw)
+	}
+	if got := h.envOf("GREETING"); len(got) != 1 || !got["good"] {
+		t.Fatalf("after two failed changes want the old instances serving, got %v", got)
+	}
+
+	// A bad value stored without a restart is not tried, so not undone. The next rollout, here a new
+	// version, fails on it, and the error points at the environment.
+	if code, body := h.do(http.MethodPatch, "/apps/web/env?restart=false", strings.NewReader(`{"set":{"FAKEAPP_FAIL":"1"}}`)); code != 200 {
+		t.Fatalf("store without restart: %d %s", code, body)
+	}
+	if got := h.envOf("GREETING"); !h.status().EnvPending || !got["good"] {
+		t.Fatalf("stored change: want pending and the old instances serving, got %v", got)
+	}
+	f, _ := os.Open(binV2)
+	defer f.Close()
+	code, body = h.do(http.MethodPut, "/apps/web/releases/v2", f)
+	if code != 500 || !strings.Contains(body, "may be a variable and not the binary") {
+		t.Fatalf("rollout on a bad pending environment: %d %s", code, body)
+	}
+	if st := h.status(); st.Version != versionBuiltin || !st.EnvPending || fmt.Sprint(st.EnvOverrides) != "[FAKEAPP_FAIL]" {
+		t.Fatalf("after that failed rollout: %+v", st)
+	}
+	// Fixing the environment lets the same version roll out.
+	if code, body := h.do(http.MethodDelete, "/apps/web/env?restart=false", nil); code != 200 {
+		t.Fatalf("clear: %d %s", code, body)
+	}
+	if code, body := h.do(http.MethodPost, "/apps/web/releases/v2/activate", nil); code != 200 || strings.Contains(body, "env_pending") {
+		t.Fatalf("activate after the fix: %d %s", code, body)
+	}
+
+	// An app without env_file: overrides work, file calls are refused.
+	h2 := startDrover(t, nil)
+	if code, _ := h2.do(http.MethodPatch, "/apps/web/env/file", strings.NewReader(`{"set":{"A":"1"}}`)); code != 409 {
+		t.Fatalf("file change without env_file: want 409, got %d", code)
+	}
+	if code, _ := h2.do(http.MethodPatch, "/apps/web/env", strings.NewReader(`{"set":{"A":"1"}}`)); code != 200 {
+		t.Fatalf("override without env_file: want 200, got %d", code)
+	}
+}
+
+func TestEnvFileText(t *testing.T) {
+	vars, names, err := parseEnv([]byte("# c\n\nA=1\nexport B = two words \nC='single $x'\nD=\"q\\\"uo\\nte\"\nE=\n"))
+	want := []string{"A=1", "B=two words", "C=single $x", "D=q\"uo\nte", "E="}
+	if err != nil || fmt.Sprint(vars) != fmt.Sprint(want) || fmt.Sprint(names) != "[A B C D E]" {
+		t.Fatalf("parseEnv: %q %v %v", vars, names, err)
+	}
+	if _, _, err := parseEnv([]byte("A=1\nnope\n")); err == nil || !strings.Contains(err.Error(), "line 2") {
+		t.Fatalf("a bad line should be reported with its number: %v", err)
+	}
+	// Whatever is written reads back as the same value.
+	for _, v := range []string{"plain", "", " padded ", "two words", `quo"te`, "new\nline", `back\slash`, "has#hash", "it's"} {
+		_, got, ok, err := parseEnvLine(formatEnvLine("K", v))
+		if err != nil || !ok || got != v {
+			t.Fatalf("round trip of %q gave %q (%v)", v, got, err)
+		}
 	}
 }
