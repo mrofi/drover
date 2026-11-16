@@ -1,13 +1,17 @@
 package main
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -43,7 +47,9 @@ func TestMain(m *testing.M) {
 
 var nextBase atomic.Int64
 
-func init() { nextBase.Store(int64(21000 + os.Getpid()%2000*10)) }
+// Instance ports for the tests stay below 32768: from there up Linux hands ports to outgoing connections,
+// and an instance cannot bind a port that a client connection happens to hold.
+func init() { nextBase.Store(int64(10000 + os.Getpid()%1000*20)) }
 
 type harness struct {
 	t     *testing.T
@@ -815,6 +821,433 @@ func TestEnvFileText(t *testing.T) {
 		_, got, ok, err := parseEnvLine(formatEnvLine("K", v))
 		if err != nil || !ok || got != v {
 			t.Fatalf("round trip of %q gave %q (%v)", v, got, err)
+		}
+	}
+}
+
+// --- folder apps
+
+type entry struct {
+	name, body string
+	mode       int64
+	link       string // a symlink to this target, when set
+}
+
+func tarOf(t *testing.T, gz bool, entries ...entry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	var w io.Writer = &buf
+	var zw *gzip.Writer
+	if gz {
+		zw = gzip.NewWriter(&buf)
+		w = zw
+	}
+	tw := tar.NewWriter(w)
+	for _, e := range entries {
+		hdr := &tar.Header{Name: e.name, Mode: e.mode, Size: int64(len(e.body)), Typeflag: tar.TypeReg}
+		if hdr.Mode == 0 {
+			hdr.Mode = 0o644
+		}
+		switch {
+		case e.link != "":
+			hdr.Typeflag, hdr.Linkname, hdr.Size = tar.TypeSymlink, e.link, 0
+		case strings.HasSuffix(e.name, "/"):
+			hdr.Typeflag, hdr.Mode, hdr.Size = tar.TypeDir, 0o755, 0
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		tw.Write([]byte(e.body))
+	}
+	tw.Close()
+	if zw != nil {
+		zw.Close()
+	}
+	return buf.Bytes()
+}
+
+func zipOf(t *testing.T, entries ...entry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, e := range entries {
+		hdr := &zip.FileHeader{Name: e.name, Method: zip.Deflate}
+		mode := fs.FileMode(0o644)
+		if e.mode != 0 {
+			mode = fs.FileMode(e.mode)
+		}
+		hdr.SetMode(mode)
+		w, err := zw.CreateHeader(hdr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Write([]byte(e.body))
+	}
+	zw.Close()
+	return buf.Bytes()
+}
+
+// launcher is a small script that becomes the test app: the "server" of a folder release, without putting
+// a whole binary into every test archive.
+func launcher(bin string) string { return "#!/bin/sh\nexec " + bin + " \"$@\"\n" }
+
+// startFolderApp runs the test app from a folder: {dir}/server, with a version.txt beside it.
+func startFolderApp(t *testing.T, mutate func(*Config)) (*harness, string) {
+	t.Helper()
+	builtin := filepath.Join(t.TempDir(), "site")
+	os.MkdirAll(builtin, 0o755)
+	os.WriteFile(filepath.Join(builtin, "server"), []byte(launcher(binV1)), 0o755)
+	os.WriteFile(filepath.Join(builtin, "version.txt"), []byte("one"), 0o644)
+	h := startDrover(t, func(c *Config) {
+		a := c.Apps[0]
+		a.Command, a.Folder = Command{"{dir}/server", "--port", "{port}"}, builtin
+		a.Env = map[string]string{"DEPS": "{dir}/deps"}
+		if mutate != nil {
+			mutate(c)
+		}
+	})
+	return h, builtin
+}
+
+func (h *harness) body(path string) string {
+	h.t.Helper()
+	code, body := h.get(path)
+	if code != 200 {
+		h.t.Fatalf("GET %s: %d %s", path, code, body)
+	}
+	return strings.TrimSpace(body)
+}
+
+func TestFolderReleases(t *testing.T) {
+	h, builtin := startFolderApp(t, nil)
+	v2 := launcher(binV2)
+	if got := h.body("/file?name=version.txt"); got != "one" || h.body("/cwd") != builtin {
+		t.Fatalf("built-in folder: version.txt %q, cwd %q (want %q)", got, h.body("/cwd"), builtin)
+	}
+	if got := h.body("/env?name=DEPS"); got != builtin+"/deps" {
+		t.Fatalf("{dir} in an env value: %q", got)
+	}
+	if got := h.body("/env?name=DROVER_DIR"); got != builtin {
+		t.Fatalf("DROVER_DIR: %q", got)
+	}
+
+	// A tar.gz upload becomes the folder of the new version.
+	archive := tarOf(t, true,
+		entry{name: "./"}, entry{name: "./server", body: v2, mode: 0o755},
+		entry{name: "./version.txt", body: "two"}, entry{name: "./static/"},
+		entry{name: "./static/app.js", body: "js"}, entry{name: "./current.txt", link: "version.txt"})
+	code, body := h.do(http.MethodPut, "/apps/web/releases/v2", bytes.NewReader(archive))
+	if code != 200 || !strings.Contains(body, `"folder":true`) {
+		t.Fatalf("upload tar.gz: %d %s", code, body)
+	}
+	dir := filepath.Join(h.d.cfg.Data, "web", "releases", "v2", "tree")
+	if h.body("/file?name=version.txt") != "two" || h.body("/file?name=static/app.js") != "js" ||
+		h.body("/file?name=current.txt") != "two" || h.body("/cwd") != dir {
+		t.Fatalf("v2 folder is not what was uploaded (cwd %s)", h.body("/cwd"))
+	}
+	if versions, pids := h.served(20); !versions["v2"] || len(versions) != 1 || len(pids) != 2 {
+		t.Fatalf("after upload want 2 processes on v2, got %v %v", versions, pids)
+	}
+	if _, body := h.do(http.MethodGet, "/apps/web/releases", nil); !strings.Contains(body, `"version":"v2","size":`) || !strings.Contains(body, `"files":3`) {
+		t.Fatalf("release list: %s", body)
+	}
+
+	// Back to the folder from the image, then a zip with the build in a subfolder.
+	if code, body := h.do(http.MethodPost, "/apps/web/rollback", nil); code != 200 {
+		t.Fatalf("rollback: %d %s", code, body)
+	}
+	if h.body("/file?name=version.txt") != "one" {
+		t.Fatal("rollback did not go back to the built-in folder")
+	}
+	z := zipOf(t, entry{name: "repo-main/README.md", body: "not part of the build"},
+		entry{name: "repo-main/dist/server", body: v2, mode: 0o755},
+		entry{name: "repo-main/dist/version.txt", body: "three"})
+	if code, body := h.do(http.MethodPut, "/apps/web/releases/v3?subdir=repo-main/dist", bytes.NewReader(z)); code != 200 {
+		t.Fatalf("upload zip with subdir: %d %s", code, body)
+	}
+	if h.body("/file?name=version.txt") != "three" {
+		t.Fatal("v3 is not the subfolder of the zip")
+	}
+	if _, err := os.Stat(filepath.Join(h.d.cfg.Data, "web", "releases", "v3", "tree", "README.md")); err == nil {
+		t.Fatal("a file outside subdir was kept")
+	}
+
+	// A folder that cannot run is not activated, like a binary that cannot.
+	bad := tarOf(t, false, entry{name: "server", body: "#!/bin/sh\necho broken build\nexit 1\n", mode: 0o755})
+	if code, body := h.do(http.MethodPut, "/apps/web/releases/bad", bytes.NewReader(bad)); code != 500 || !strings.Contains(body, "broken build") {
+		t.Fatalf("a folder that does not start: %d %s", code, body)
+	}
+	if h.body("/file?name=version.txt") != "three" {
+		t.Fatal("a failed folder rollout changed what is served")
+	}
+	if code, _ := h.do(http.MethodDelete, "/apps/web/releases/v2", nil); code != 204 {
+		t.Fatalf("delete a folder version: %d", code)
+	}
+}
+
+func TestFolderArchivesThatAreRefused(t *testing.T) {
+	h, _ := startFolderApp(t, func(c *Config) { c.MaxBinaryBytes = 1 << 20 })
+	outside := filepath.Join(h.d.cfg.Data, "escaped")
+	put := func(name string, body []byte) (int, string) {
+		return h.do(http.MethodPut, "/apps/web/releases/"+name, bytes.NewReader(body))
+	}
+	for name, tc := range map[string]struct {
+		archive []byte
+		want    string
+	}{
+		"abs-link":       {tarOf(t, false, entry{name: "server", body: "x"}, entry{name: "etc", link: "/etc"}), "points outside the release"},
+		"up-link":        {tarOf(t, false, entry{name: "server", body: "x"}, entry{name: "a/up", link: "../../x"}), "points outside the release"},
+		"empty":          {tarOf(t, false, entry{name: "only-a-dir/"}), "no files"},
+		"too-big":        {tarOf(t, true, entry{name: "big", body: strings.Repeat("0", 2<<20)}), "max_binary_bytes"},
+		"not-an-archive": {[]byte("just some text, not an archive"), "not a readable"},
+		"xz":             {[]byte{0xfd, '7', 'z', 'X', 'Z', 0, 0, 0}, "not supported"},
+		// A file "inside" a link: writing it must not follow the link.
+		"through-link": {tarOf(t, false, entry{name: "server", body: "x"}, entry{name: "link", link: "target"}, entry{name: "link/through", body: "z"}), "both a link and a folder"},
+	} {
+		if code, body := put(name, tc.archive); code != 400 || !strings.Contains(body, tc.want) {
+			t.Errorf("%s: want 400 with %q, got %d %s", name, tc.want, code, body)
+		}
+	}
+	// Names that try to leave the folder are kept inside it; nothing is written outside.
+	sneaky := tarOf(t, false, entry{name: "../../escaped", body: "x"}, entry{name: "/abs", body: "y"})
+	code, body := h.do(http.MethodPut, "/apps/web/releases/sneaky?activate=false", bytes.NewReader(sneaky))
+	tree := filepath.Join(h.d.cfg.Data, "web", "releases", "sneaky", "tree")
+	if _, err := os.Stat(filepath.Join(tree, "escaped")); code != 201 || err != nil {
+		t.Fatalf("sneaky names: %d %s (%v)", code, body, err)
+	}
+	if _, err := os.Stat(outside); err == nil {
+		t.Fatal("an entry was written outside the release")
+	}
+	entries, _ := os.ReadDir(filepath.Join(h.d.cfg.Data, "web", "releases"))
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".incoming") {
+			t.Fatalf("a refused release left %s behind", e.Name())
+		}
+	}
+	if code, body := h.do(http.MethodPut, "/apps/web/releases/x?subdir=nope", bytes.NewReader(tarOf(t, false, entry{name: "server", body: "x"}))); code != 400 || !strings.Contains(body, "no files") {
+		t.Fatalf("a subdir that is not in the archive: %d %s", code, body)
+	}
+
+	// A file app does not take folders, and the other way round.
+	h2 := startDrover(t, nil)
+	if code, body := h2.do(http.MethodPut, "/apps/web/releases/x?subdir=dist", strings.NewReader("x")); code != 400 || !strings.Contains(body, "folder apps") {
+		t.Fatalf("subdir on a file app: %d %s", code, body)
+	}
+	if code, body := h2.do(http.MethodPost, "/apps/web/releases", strings.NewReader(`{"git":"https://example.com/x.git"}`)); code != 400 || !strings.Contains(body, "single binary") {
+		t.Fatalf("git on a file app: %d %s", code, body)
+	}
+	bad := &Config{Apps: []*AppConfig{{Name: "a", Command: Command{"{dir}/x"}, Binary: "/x", Listen: ":1"}}}
+	if err := bad.normalize(); err == nil || !strings.Contains(err.Error(), "folder app") {
+		t.Fatalf("binary: with {dir}: %v", err)
+	}
+}
+
+func TestFolderFromGitImageAndURL(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	gitSchemes["file"] = true
+	defer delete(gitSchemes, "file")
+	v2 := launcher(binV2)
+
+	// A repository with the build in build/out, a tag on the first commit and a second commit on top.
+	repo := t.TempDir()
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.com"}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	write := func(version string) {
+		os.MkdirAll(filepath.Join(repo, "build", "out"), 0o755)
+		os.WriteFile(filepath.Join(repo, "README.md"), []byte("source"), 0o644)
+		os.WriteFile(filepath.Join(repo, "build", "out", "server"), []byte(v2), 0o755)
+		os.WriteFile(filepath.Join(repo, "build", "out", "version.txt"), []byte(version), 0o644)
+		run("add", "-A")
+		run("commit", "-q", "-m", version)
+	}
+	run("init", "-q", "-b", "main")
+	write("git-first")
+	run("tag", "v1.0")
+	first := run("rev-parse", "HEAD")
+	write("git-second")
+
+	h, _ := startFolderApp(t, nil)
+	post := func(v any) (int, string) {
+		b, _ := json.Marshal(v)
+		return h.do(http.MethodPost, "/apps/web/releases", bytes.NewReader(b))
+	}
+	url := "file://" + repo
+	if code, body := post(map[string]any{"git": url, "subdir": "build/out", "version": "head"}); code != 200 {
+		t.Fatalf("git HEAD: %d %s", code, body)
+	}
+	if h.body("/file?name=version.txt") != "git-second" {
+		t.Fatal("git HEAD did not give the latest commit")
+	}
+	tree := filepath.Join(h.d.cfg.Data, "web", "releases", "head", "tree")
+	for _, gone := range []string{".git", "README.md", "build"} {
+		if _, err := os.Stat(filepath.Join(tree, gone)); err == nil {
+			t.Fatalf("%s is in the release, outside the subdir", gone)
+		}
+	}
+	if code, body := post(map[string]any{"git": url, "ref": "v1.0", "subdir": "build/out", "version": "tag"}); code != 200 {
+		t.Fatalf("git tag: %d %s", code, body)
+	}
+	if h.body("/file?name=version.txt") != "git-first" {
+		t.Fatal("git ref v1.0 did not give the tagged commit")
+	}
+	if _, body := h.do(http.MethodGet, "/apps/web/releases", nil); !strings.Contains(body, "@"+first+":build/out") {
+		t.Fatalf("the release does not record the commit: %s", body)
+	}
+	for name, tc := range map[string]struct {
+		req  map[string]any
+		code int
+	}{
+		"missing subdir": {map[string]any{"git": url, "subdir": "nope"}, 400},
+		"missing ref":    {map[string]any{"git": url, "ref": "no-such-branch"}, 502},
+		"option as ref":  {map[string]any{"git": url, "ref": "--upload-pack=x"}, 400},
+		"ssh url":        {map[string]any{"git": "ssh://git@example.com/x.git"}, 400},
+		"creds in url":   {map[string]any{"git": "https://u:p@example.com/x.git"}, 400},
+	} {
+		if code, body := post(tc.req); code != tc.code {
+			t.Errorf("%s: want %d, got %d %s", name, tc.code, code, body)
+		}
+	}
+
+	// A folder inside a container image, through image-file-fetch, and an archive by URL.
+	var imageReq map[string]string
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/download":
+			json.NewDecoder(r.Body).Decode(&imageReq)
+			w.Header().Set("Content-Type", "application/x-tar")
+			w.Write(tarOf(t, false, entry{name: "server", body: v2, mode: 0o755}, entry{name: "version.txt", body: "from-image"}))
+		case "/site.tar.gz":
+			w.Write(tarOf(t, true, entry{name: "site/server", body: v2, mode: 0o755}, entry{name: "site/version.txt", body: "from-url"}))
+		}
+	}))
+	defer src.Close()
+	h.d.cfg.ImageFetchURL = src.URL
+	if code, body := post(map[string]any{"image": "ghcr.io/me/site:2", "path": "/var/www", "version": "img"}); code != 200 {
+		t.Fatalf("image folder: %d %s", code, body)
+	}
+	if imageReq["archive"] != "tar" || imageReq["path"] != "/var/www" || h.body("/file?name=version.txt") != "from-image" {
+		t.Fatalf("image folder: asked %v, serving %q", imageReq, h.body("/file?name=version.txt"))
+	}
+	if code, body := post(map[string]any{"url": src.URL + "/site.tar.gz", "subdir": "site", "version": "url"}); code != 200 {
+		t.Fatalf("archive URL: %d %s", code, body)
+	}
+	if h.body("/file?name=version.txt") != "from-url" {
+		t.Fatal("archive URL with subdir did not become the release")
+	}
+}
+
+func TestTarGzDirRoundTrip(t *testing.T) {
+	src := t.TempDir()
+	os.MkdirAll(filepath.Join(src, "a", "b"), 0o755)
+	os.WriteFile(filepath.Join(src, "a", "b", "f.txt"), []byte("hello"), 0o640)
+	os.WriteFile(filepath.Join(src, "run.sh"), []byte("#!/bin/sh\n"), 0o755)
+	os.Symlink("a/b/f.txt", filepath.Join(src, "link"))
+	var buf bytes.Buffer
+	if err := tarGzDir(src, &buf); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(t.TempDir(), "a.tgz")
+	os.WriteFile(archive, buf.Bytes(), 0o644)
+	dest := t.TempDir()
+	if err := extractArchive(archive, dest, "", 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if files, size, err := checkTree(dest, 1<<20); err != nil || files != 2 || size != 15 {
+		t.Fatalf("checkTree: %d files, %d bytes, %v", files, size, err)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(dest, "link")); string(raw) != "hello" {
+		t.Fatalf("the link does not lead to the file: %q", raw)
+	}
+	if st, _ := os.Stat(filepath.Join(dest, "run.sh")); st == nil || st.Mode().Perm()&0o100 == 0 {
+		t.Fatal("the executable bit was lost")
+	}
+}
+
+func TestURLSourceThatNeedsAuthorization(t *testing.T) {
+	payload, _ := os.ReadFile(binV2)
+	// The storage host a download is redirected to. It must never see the caller's credentials.
+	var storageSaw http.Header
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		storageSaw = r.Header.Clone()
+		w.Write(payload)
+	}))
+	defer storage.Close()
+	// The site that needs a token or a login.
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, basic := r.BasicAuth()
+		token := r.Header.Get("Private-Token") == "t0ken" || r.Header.Get("Authorization") == "Bearer t0ken"
+		if !token && !(basic && user == "ci" && pass == "s3cret") {
+			http.Error(w, "login needed", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/file":
+			w.Write(payload)
+		case "/same-host":
+			http.Redirect(w, r, "/file", http.StatusFound)
+		case "/other-host":
+			http.Redirect(w, r, storage.URL+"/blob", http.StatusFound)
+		}
+	}))
+	defer site.Close()
+
+	h := startDrover(t, nil)
+	n := 0
+	post := func(fields map[string]any) (int, string) {
+		n++
+		fields["version"], fields["activate"] = fmt.Sprintf("r%d", n), false
+		b, _ := json.Marshal(fields)
+		return h.do(http.MethodPost, "/apps/web/releases", bytes.NewReader(b))
+	}
+	if code, body := post(map[string]any{"url": site.URL + "/file"}); code != 502 || !strings.Contains(body, "401") {
+		t.Fatalf("without credentials: want 502 naming the 401, got %d %s", code, body)
+	}
+	for name, fields := range map[string]map[string]any{
+		"custom header":        {"url": site.URL + "/file", "headers": map[string]string{"PRIVATE-TOKEN": "t0ken"}},
+		"bearer token":         {"url": site.URL + "/file", "headers": map[string]string{"Authorization": "Bearer t0ken"}},
+		"username, password":   {"url": site.URL + "/file", "username": "ci", "password": "s3cret"},
+		"login in the URL":     {"url": strings.Replace(site.URL, "://", "://ci:s3cret@", 1) + "/file"},
+		"redirect, same host":  {"url": site.URL + "/same-host", "headers": map[string]string{"PRIVATE-TOKEN": "t0ken"}},
+		"redirect, other host": {"url": site.URL + "/other-host", "headers": map[string]string{"PRIVATE-TOKEN": "t0ken"}},
+		"redirect with login":  {"url": site.URL + "/other-host", "username": "ci", "password": "s3cret"},
+	} {
+		storageSaw = nil
+		if code, body := post(fields); code != 201 {
+			t.Errorf("%s: want 201, got %d %s", name, code, body)
+		}
+		if storageSaw != nil && (storageSaw.Get("Private-Token") != "" || storageSaw.Get("Authorization") != "") {
+			t.Errorf("%s: the host the download was redirected to received the credentials: %v", name, storageSaw)
+		}
+	}
+	// Nothing that was sent as a credential is kept.
+	filepath.WalkDir(h.d.cfg.Data, func(p string, d fs.DirEntry, _ error) error {
+		if d != nil && d.Name() == "meta.json" {
+			if raw, _ := os.ReadFile(p); bytes.Contains(raw, []byte("t0ken")) || bytes.Contains(raw, []byte("s3cret")) {
+				t.Errorf("%s holds a credential: %s", p, raw)
+			}
+		}
+		return nil
+	})
+	if _, body := h.do(http.MethodGet, "/apps/web/logs?tail=1000", nil); strings.Contains(body, "t0ken") || strings.Contains(body, "s3cret") {
+		t.Errorf("the logs hold a credential: %s", body)
+	}
+	for name, fields := range map[string]map[string]any{
+		"header on an image source": {"image": "x/y:1", "path": "/a", "headers": map[string]string{"A": "b"}},
+		"Host header":               {"url": site.URL + "/file", "headers": map[string]string{"Host": "evil"}},
+		"line break in a value":     {"url": site.URL + "/file", "headers": map[string]string{"A": "b\r\nC: d"}},
+		"space in a name":           {"url": site.URL + "/file", "headers": map[string]string{"A B": "c"}},
+	} {
+		if code, body := post(fields); code != 400 {
+			t.Errorf("%s: want 400, got %d %s", name, code, body)
 		}
 	}
 }

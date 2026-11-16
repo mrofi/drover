@@ -37,8 +37,14 @@ Client (talks to a running drover; DROVER_ADMIN, default http://127.0.0.1:9100, 
   drover logs <app> [-f] [--tail n] [--instance n]
   drover metrics
   drover fetch <app> --url <url> [--version v] [--sha256 sum] [--no-activate]
+                     [--header "Name: value"]... [--username u --password p]   for a download that needs a login
   drover fetch <app> --image <ref> --path </file/in/image> [--username u --password p] [...]
   drover upload <app> <file> [--version v] [--sha256 sum] [--no-activate]
+  folder apps ({dir} in the command), a version is a whole folder:
+  drover upload <app> <folder | archive.tar.gz | .zip> [--subdir d] [--version v]
+  drover fetch <app> --url <archive url> [--subdir d]
+  drover fetch <app> --image <ref> --path </folder/in/image>
+  drover fetch <app> --git <repo url> [--ref branch|tag|commit] [--subdir d] [--username u --password token]
   drover activate <app> <version>
   drover rollback <app>
   drover restart <app>
@@ -79,6 +85,7 @@ func runServer(args []string) error {
 	listen := fs.String("listen", ":8080", "public address (without -c)")
 	instances := fs.Int("instances", 2, "number of instances (without -c)")
 	portBase := fs.Int("port-base", 9000, "first instance port (without -c)")
+	folder := fs.String("folder", "", "run from this folder, which versions replace as a whole: {dir} in the command (without -c)")
 	envFile := fs.String("env-file", "", "KEY=VALUE file read at every instance start (without -c)")
 	health := fs.String("health", "", "health check path; empty checks that the port accepts connections (without -c)")
 	admin := fs.String("admin", os.Getenv("DROVER_ADMIN_LISTEN"), "admin API address (default 127.0.0.1:9100; also DROVER_ADMIN_LISTEN)")
@@ -92,7 +99,7 @@ func runServer(args []string) error {
 	case fs.NArg() > 0:
 		// drover run [flags] -- command args...
 		cfg = &Config{Apps: []*AppConfig{{Name: *name, Command: fs.Args(), Listen: *listen,
-			Instances: *instances, PortBase: *portBase, Health: HealthConfig{Path: *health}, EnvFile: *envFile}}}
+			Instances: *instances, PortBase: *portBase, Health: HealthConfig{Path: *health}, EnvFile: *envFile, Folder: *folder}}}
 	default:
 		if *path == "" {
 			for _, p := range []string{"drover.yaml", "/etc/drover.yaml"} {

@@ -28,7 +28,10 @@ type proc struct {
 	port    int
 	version string
 	argv    []string
-	env     []string // config, env_file and overrides, as they were when the instance was created
+	env     []string          // config, env_file and overrides, as they were when the instance was created
+	repl    *strings.Replacer // {dir}, {bin}, {port}, {index} for this instance
+	workdir string
+	release string // the folder of its version, for a folder app
 
 	healthy  atomic.Bool
 	draining atomic.Bool
@@ -126,14 +129,19 @@ func (p *proc) run() {
 func (p *proc) command() *exec.Cmd {
 	cfg := p.app.cfg
 	cmd := exec.Command(p.argv[0], p.argv[1:]...)
-	cmd.Dir = cfg.Dir
+	cmd.Dir = p.workdir
 	for _, kv := range os.Environ() {
 		// The admin token lets its holder replace binaries: the apps do not get it.
 		if !strings.HasPrefix(kv, "DROVER_TOKEN=") {
 			cmd.Env = append(cmd.Env, kv)
 		}
 	}
-	cmd.Env = append(cmd.Env, p.env...)
+	for _, kv := range p.env {
+		cmd.Env = append(cmd.Env, p.repl.Replace(kv)) // PYTHONPATH={dir}/deps and the like
+	}
+	if p.release != "" {
+		cmd.Env = append(cmd.Env, "DROVER_DIR="+p.release)
+	}
 	// Last, so nothing above can give two instances the same port.
 	cmd.Env = append(cmd.Env, "PORT="+strconv.Itoa(p.port), "DROVER_APP="+cfg.Name,
 		"DROVER_INDEX="+strconv.Itoa(p.slot), "DROVER_VERSION="+p.version)

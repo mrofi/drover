@@ -10,24 +10,35 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"golang.org/x/net/http/httpguts"
 )
 
 // releaseRequest asks drover to fetch a binary itself: from a URL, or from a container image through an
 // image-file-fetch server.
 type releaseRequest struct {
-	Version  string `json:"version"`
-	URL      string `json:"url"`
-	Image    string `json:"image"`
-	Path     string `json:"path"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	SHA256   string `json:"sha256"`
-	Activate *bool  `json:"activate"`
+	Version string `json:"version"`
+	URL     string `json:"url"`
+	Image   string `json:"image"`
+	Path    string `json:"path"`
+	// Git is a repository to take a folder release from, at Ref (a branch, tag or commit; default HEAD).
+	Git string `json:"git"`
+	Ref string `json:"ref"`
+	// Subdir keeps only this folder of an archive or repository as the release.
+	Subdir string `json:"subdir"`
+	// Headers are sent with the request for a url source, for downloads that need a token. Like Username
+	// and Password they are used for this one request and never stored.
+	Headers  map[string]string `json:"headers"`
+	Username string            `json:"username"`
+	Password string            `json:"password"`
+	SHA256   string            `json:"sha256"`
+	Activate *bool             `json:"activate"`
 }
 
 func (d *Drover) adminRoutes(e *echo.Echo) {
@@ -254,22 +265,64 @@ func (d *Drover) fetchRelease(c echo.Context, a *App) error {
 	if req.Version == "" {
 		req.Version = defaultVersion()
 	}
-	body, source, err := d.open(c.Request().Context(), req)
+	activate := req.Activate == nil || *req.Activate
+	if err := checkHeaders(req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	if req.Git != "" {
+		if req.URL != "" || req.Image != "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "give one of url, image or git")
+		}
+		return d.storeGit(c, a, req, activate)
+	}
+	body, source, err := d.open(c.Request().Context(), req, a.cfg.folderMode)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadGateway, err.Error())
 	}
 	defer body.Close()
-	return d.store(c, a, req.Version, source, body, req.SHA256, req.Activate == nil || *req.Activate)
+	return d.store(c, a, req.Version, source, body, req.SHA256, req.Subdir, activate)
 }
 
-// uploadRelease stores the request body as a binary: `curl -T app-v2 .../apps/web/releases/v2`.
+// storeGit makes a folder release from a commit of a git repository, or from one folder of it.
+func (d *Drover) storeGit(c echo.Context, a *App, req releaseRequest, activate bool) error {
+	rel, err := a.store.addFolder(req.Version, d.cfg.MaxBinaryBytes, func(tree string) (string, error) {
+		clone := tree + ".clone"
+		defer os.RemoveAll(clone)
+		commit, err := gitCheckout(c.Request().Context(), req, clone)
+		if err != nil {
+			return "", err
+		}
+		sub := cleanRel(req.Subdir)
+		src := filepath.Join(clone, filepath.FromSlash(sub))
+		if st, err := os.Lstat(src); err != nil || !st.IsDir() {
+			return "", fmt.Errorf("the repository has no folder %q at %s", req.Subdir, commit[:min(12, len(commit))])
+		}
+		source := "git:" + req.Git + "@" + commit
+		if sub != "" {
+			source += ":" + sub
+		}
+		return source, os.Rename(src, tree)
+	})
+	switch {
+	case errors.Is(err, errGitRemote):
+		return echo.NewHTTPError(http.StatusBadGateway, err.Error())
+	case err != nil:
+		return httpError(err)
+	case !activate:
+		return c.JSON(http.StatusCreated, rel)
+	}
+	return d.activate(c, a, rel.Version)
+}
+
+// uploadRelease stores the request body as a version: `curl -T app-v2 .../apps/web/releases/v2`. For a
+// folder app the body is an archive, and ?subdir= keeps one folder of it.
 func (d *Drover) uploadRelease(c echo.Context, a *App) error {
 	activate := c.QueryParam("activate") != "false"
-	return d.store(c, a, c.Param("version"), "upload", c.Request().Body, c.QueryParam("sha256"), activate)
+	return d.store(c, a, c.Param("version"), "upload", c.Request().Body, c.QueryParam("sha256"), c.QueryParam("subdir"), activate)
 }
 
-func (d *Drover) store(c echo.Context, a *App, version, source string, r io.Reader, sha string, activate bool) error {
-	rel, err := a.store.add(version, source, r, sha, d.cfg.MaxBinaryBytes)
+func (d *Drover) store(c echo.Context, a *App, version, source string, r io.Reader, sha, subdir string, activate bool) error {
+	rel, err := a.store.add(version, source, r, sha, d.cfg.MaxBinaryBytes, subdir)
 	if err != nil {
 		return httpError(err)
 	}
@@ -279,8 +332,51 @@ func (d *Drover) store(c echo.Context, a *App, version, source string, r io.Read
 	return d.activate(c, a, rel.Version)
 }
 
-// open returns the binary named by the request as a stream.
-func (d *Drover) open(ctx context.Context, req releaseRequest) (io.ReadCloser, string, error) {
+// Headers a caller may not set: they describe the request itself.
+var fixedHeaders = map[string]bool{"Host": true, "Content-Length": true, "Transfer-Encoding": true, "Connection": true}
+
+// checkHeaders refuses headers on sources that have no use for them, and names or values that are not
+// valid in an HTTP request.
+func checkHeaders(req releaseRequest) error {
+	if len(req.Headers) == 0 {
+		return nil
+	}
+	if req.URL == "" {
+		return errors.New("headers are only for url sources (image and git take username and password)")
+	}
+	for k, v := range req.Headers {
+		if !httpguts.ValidHeaderFieldName(k) || fixedHeaders[http.CanonicalHeaderKey(k)] {
+			return fmt.Errorf("header %q cannot be set", k)
+		}
+		if !httpguts.ValidHeaderFieldValue(v) {
+			return fmt.Errorf("the value of header %q is not valid", k)
+		}
+	}
+	return nil
+}
+
+// keepCredentialsOnHost is a redirect policy: when a download is redirected to another host (or from https
+// to http), the caller's headers and the Authorization header are dropped, so a token is never sent to a
+// server it was not meant for. Go itself only drops Authorization, and only for unrelated domains.
+func keepCredentialsOnHost(headers map[string]string) func(*http.Request, []*http.Request) error {
+	return func(next *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		first := via[0].URL
+		if next.URL.Host != first.Host || (first.Scheme == "https" && next.URL.Scheme != "https") {
+			next.Header.Del("Authorization")
+			for k := range headers {
+				next.Header.Del(k)
+			}
+		}
+		return nil
+	}
+}
+
+// open returns what the request names as a stream: a binary, or for a folder app an archive. An image
+// folder is asked from image-file-fetch as a tar.
+func (d *Drover) open(ctx context.Context, req releaseRequest, folder bool) (io.ReadCloser, string, error) {
 	var hreq *http.Request
 	var source string
 	switch {
@@ -292,6 +388,12 @@ func (d *Drover) open(ctx context.Context, req releaseRequest) (io.ReadCloser, s
 			return nil, "", errors.New("url must be an http or https URL")
 		}
 		hreq, _ = http.NewRequestWithContext(ctx, http.MethodGet, req.URL, nil)
+		for k, v := range req.Headers {
+			hreq.Header.Set(k, v)
+		}
+		if (req.Username != "" || req.Password != "") && hreq.Header.Get("Authorization") == "" {
+			hreq.SetBasicAuth(req.Username, req.Password)
+		}
 		// Credentials in the URL are not written to meta.json.
 		source = u.Redacted()
 	case req.Image != "":
@@ -299,17 +401,23 @@ func (d *Drover) open(ctx context.Context, req releaseRequest) (io.ReadCloser, s
 			return nil, "", errors.New("image sources need image_fetch_url (or DROVER_IMAGE_FETCH_URL) to point at an image-file-fetch server")
 		}
 		if req.Path == "" {
-			return nil, "", errors.New("image sources need path: the file's place inside the image")
+			return nil, "", errors.New("image sources need path: the place of the file (or, for a folder app, the folder) inside the image")
 		}
-		payload, _ := json.Marshal(map[string]string{"image": req.Image, "path": req.Path,
-			"username": req.Username, "password": req.Password})
+		fields := map[string]string{"image": req.Image, "path": req.Path,
+			"username": req.Username, "password": req.Password}
+		if folder {
+			fields["archive"] = "tar"
+		}
+		payload, _ := json.Marshal(fields)
 		hreq, _ = http.NewRequestWithContext(ctx, http.MethodPost, d.cfg.ImageFetchURL+"/download", bytes.NewReader(payload))
 		hreq.Header.Set("Content-Type", "application/json")
 		source = req.Image + ":" + req.Path
 	default:
-		return nil, "", errors.New("give a url, or an image and a path")
+		return nil, "", errors.New("give a url, an image and a path, or (for a folder app) a git repository")
 	}
-	resp, err := d.fetcher.Do(hreq)
+	client := *d.fetcher
+	client.CheckRedirect = keepCredentialsOnHost(req.Headers)
+	resp, err := client.Do(hreq)
 	if err != nil {
 		return nil, "", fmt.Errorf("fetching %s: %w", source, err)
 	}

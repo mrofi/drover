@@ -35,6 +35,10 @@ apps:
     command: /usr/local/bin/web --port {port}
     # Only needed when the binary is not the first word, e.g. command: "node {bin} --port {port}".
     # binary: /srv/server.js
+    # A folder app (PHP, Node, Python): versions are whole folders. {dir} is the folder of the version an
+    # instance runs and its working directory. folder is the built-in version and may not exist yet.
+    # command: php -S 127.0.0.1:{port} -t {dir}/public
+    # folder: /srv/site
     listen: ":8080"
     instances: 2
     # Instances get ports port_base .. port_base + 2*instances - 1 (a rollout runs old and new side by side).

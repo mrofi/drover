@@ -20,6 +20,20 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("fakeapp", version, "listening on", *port)
+	// /file returns a file relative to the working directory, and /cwd the directory itself: a folder app
+	// is started in the folder of its version.
+	http.HandleFunc("/file", func(w http.ResponseWriter, r *http.Request) {
+		data, err := os.ReadFile(r.URL.Query().Get("name"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		w.Write(data)
+	})
+	http.HandleFunc("/cwd", func(w http.ResponseWriter, r *http.Request) {
+		wd, _ := os.Getwd()
+		fmt.Fprintln(w, wd)
+	})
 	http.HandleFunc("/env", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, os.Getenv(r.URL.Query().Get("name")))
 	})

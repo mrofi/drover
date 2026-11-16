@@ -10,7 +10,9 @@
 - Each instance is one process on its own loopback port (`port_base`, `port_base+1`, ...). drover restarts it
   when it exits (delay 1s, doubling to 30s).
 - The load balancer on `listen` sends each request to the healthy instance with the fewest open requests.
-- A **version** is a stored copy of the app's binary with a name you choose. `builtin` is the binary that
+- An app is a **file app** (a version is one binary, `{bin}`) or a **folder app** (a version is a whole
+  folder, `{dir}`): see Folder apps. Everything else is the same for both.
+- A **version** is a stored copy of the app's binary (or folder) with a name you choose. `builtin` is the binary that
   was already on disk. Exactly one version is **current**; drover also remembers the **previous** one.
 - A **rollout** switches versions one instance at a time: start the new instance on a spare port, wait until
   it is healthy, give it the slot, let the old one finish open requests (`drain_timeout`), stop it. If a new
@@ -27,7 +29,7 @@ drover run -c drover.yaml
 ```
 
 Flags for `drover run` without `-c`: `--name app` `--listen :8080` `--instances 2` `--port-base 9000`
-`--health ""` `--env-file ""`. With or without `-c`: `--admin 127.0.0.1:9100` `--data <dir>` `--metrics <addr>`. Config path may also come from
+`--health ""` `--env-file ""` `--folder ""`. With or without `-c`: `--admin 127.0.0.1:9100` `--data <dir>` `--metrics <addr>`. Config path may also come from
 `DROVER_CONFIG`, else `./drover.yaml`, else `/etc/drover.yaml`. The admin address may also come from
 `DROVER_ADMIN_LISTEN` (order: `--admin`, then the variable, then the config file).
 
@@ -52,6 +54,31 @@ stops every instance, then drover.
 | `PORT=3000 myapp --env /etc/myapp.env` | `drover run --listen :3000 -- myapp --env /etc/myapp.env` |
 | `node /srv/server.js` (reads $PORT) | config: `command: node {bin}`, `binary: /srv/server.js` |
 
+### Folder apps (PHP, Node, Python, static files)
+
+An app is a folder app when its command uses `{dir}` or the config has `folder:`. Then:
+
+- A version is a folder. `{dir}` = the folder of the version an instance runs = its working directory.
+  `{dir}` also works in `dir:` and in env values (`PYTHONPATH={dir}/deps`); `DROVER_DIR` is set.
+- `{bin}` and `binary:` are not allowed. `folder:` is the built-in version and may not exist yet.
+- Examples: `php -S 127.0.0.1:{port} -t {dir}/public`, `node {dir}/dist/server.js`,
+  `python {dir}/app.py`, `python3 -m http.server {port} --bind 127.0.0.1` (serves `{dir}`).
+- Sources, each with optional `subdir` (keep one folder of what was fetched):
+  - upload: `drover upload <app> <folder|archive> [--subdir d]`; HTTP `PUT .../releases/<v>?subdir=d`
+    with a tar, tar.gz, tar.bz2 or zip body. The subcommand tars a local folder itself.
+  - URL of an archive: `drover fetch <app> --url <u> [--subdir d]`; `{"url","subdir"}`.
+  - git: `drover fetch <app> --git <https url> [--ref branch|tag|commit] [--subdir d]`;
+    `{"git","ref","subdir","username","password"}`. Needs `git` in the container; http(s) only.
+  - image folder: `drover fetch <app> --image <ref> --path </folder>`; `{"image","path"}`, through
+    image-file-fetch (which must support `"archive":"tar"`).
+- drover does not build: the folder must already hold dependencies (`vendor/`, `node_modules/`, a
+  `--target` directory). The interpreter comes from the image.
+- The folder's path changes per version; the app must not keep its own absolute path, and must write its
+  data elsewhere.
+- Refused with 400: a link that points outside the folder, a device or socket, an archive with no files
+  (also: a `subdir` that is not in it), more than `max_binary_bytes` packed or unpacked, xz and zstd,
+  a single file sent to a folder app, `subdir` or `git` sent to a file app.
+
 ### Config file
 
 Only `name`, `command`, `listen` are required. Unknown keys are an error. Values shown are the defaults.
@@ -70,9 +97,11 @@ apps:
   - name: web                         # letters, digits, . _ -  (max 64)
     command: /usr/local/bin/web --port {port}   # string or YAML list
     binary: ""                        # default: first word of command
+    folder: ""                        # set (or use {dir}) to make it a folder app; the built-in folder
     listen: ":8080"
     instances: 1                      # (the --instances flag defaults to 2)
-    port_base: 9000                   # uses port_base .. port_base+2*instances-1; apps must not overlap
+    port_base: 9000                   # uses port_base .. port_base+2*instances-1; apps must not overlap;
+                                      # keep below 32768 (above it Linux uses ports for outgoing connections)
     health:
       path: ""                        # GET, 2xx/3xx = healthy. Empty = TCP connect to the port.
       interval: 2s
@@ -106,7 +135,7 @@ Positional arguments come before flags. Commands that roll out block until the r
 | Drop all overrides | `drover env clear <app>` | `DELETE /apps/<app>/env` |
 | Edit variables in the env file | `drover env set <app> --file K=V...` / `drover env unset <app> --file K...` | `PATCH /apps/<app>/env/file` (same JSON) |
 | Replace the env file | `drover env put <app> <file>` | `PUT /apps/<app>/env/file` (body = the file) |
-| Add a version from a file | `drover upload <app> <file> --version <v>` | `PUT /apps/<app>/releases/<v>` (body = the file; `curl -T file URL`) |
+| Add a version from a file (folder app: a folder or archive) | `drover upload <app> <path> --version <v>` | `PUT /apps/<app>/releases/<v>` (body = the file or archive; `curl -T file URL`) |
 | Add a version from a URL | `drover fetch <app> --url <url> --version <v>` | `POST /apps/<app>/releases` `{"url":"...","version":"v"}` |
 | Add a version from a container image | `drover fetch <app> --image <ref> --path </file> --version <v>` | `POST /apps/<app>/releases` `{"image":"...","path":"...","version":"v"}` |
 | Switch to a version | `drover activate <app> <v>` | `POST /apps/<app>/releases/<v>/activate` |
@@ -117,8 +146,11 @@ Positional arguments come before flags. Commands that roll out block until the r
 
 Adding a version also switches to it. To only store it: `--no-activate`, `"activate": false`, or
 `?activate=false` on the PUT. Optional checksum: `--sha256 <hex>`, `"sha256"`, or `?sha256=`. Without a
-version name, fetch and `drover upload` use a UTC timestamp like `20261116-154400`. Private image:
-`--username`/`--password` or `"username"`/`"password"`. Version names: letters, digits, `.` `_` `-`, max 64,
+version name, fetch and `drover upload` use a UTC timestamp like `20261116-154400`. Login for a source:
+`--username`/`--password` (`"username"`/`"password"`) for a private image, a git repository, or basic auth
+on a URL; `--header "Name: value"` (`"headers":{"Name":"value"}`) for a URL that needs a token. They are
+used for that request only, never stored or logged, and not sent on when a download is redirected to
+another host. Version names: letters, digits, `.` `_` `-`, max 64,
 not `builtin`. A name cannot be reused; delete it first.
 
 ### Environment
@@ -178,7 +210,7 @@ Code `499` = client went away, `101` = upgraded connection. Counters reset when 
 | 404 | No such app or version. |
 | 409 | Version name already exists; another rollout of this app is running; no previous version to roll back to; tried to delete the current version or `builtin`. |
 | 500 | Rollout failed and was undone. The app is still on the version from before. A version that was just added stays stored. When the new binary exited, the message ends with its last output lines. |
-| 502 | drover could not download the URL or image file. Nothing was stored. |
+| 502 | drover could not download the URL or image file, or fetch from the git repository. Nothing was stored. |
 
 Errors are `{"message": "..."}`.
 
@@ -194,7 +226,9 @@ Instance `state`: `healthy` (gets traffic), `unhealthy` (running, failing its ch
 to restart), `draining` (old instance finishing requests), `empty` (no binary to run yet). `restarts` counts
 exits of that instance since it was started.
 
-Release entry: `{"version","size","sha256","source","created","current"}`.
+Release entry: `{"version","size","files","sha256","source","created","current"}` (`files` for folder
+versions; a git version's `source` is `git:<url>@<commit>:<subdir>`). Status has `"folder": true` for a
+folder app.
 
 ## Recipes
 
@@ -242,6 +276,7 @@ Read-only root filesystem: set `DROVER_DATA` to a writable mount that allows exe
 ## Limits
 
 - HTTP/1.1 to instances only. No TLS, no raw TCP, no sticky sessions.
+- No build step: folder versions are used as they arrive.
 - WebSockets work. A rollout closes connections still open on an old instance after `drain_timeout`;
   clients must reconnect.
 - The instance count cannot change while running: change the config and restart drover.

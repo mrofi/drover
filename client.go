@@ -79,16 +79,28 @@ func runClient(cmd string, args []string) error {
 		}
 		return call(http.MethodDelete, "/apps/"+app+"/releases/"+url.PathEscape(arg(1)), nil, "")
 	case "fetch":
-		if err := need(1, "<app> --url <url> | --image <ref> --path <file>"); err != nil {
+		if err := need(1, "<app> --url <url> | --image <ref> --path <file or folder> | --git <url> [--ref r] [--subdir d]"); err != nil {
 			return err
 		}
 		fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 		var req releaseRequest
-		fs.StringVar(&req.URL, "url", "", "download the binary from this URL")
+		req.Headers = map[string]string{}
+		fs.Func("header", `a header to send with a --url download, as "Name: value" (repeatable)`, func(h string) error {
+			k, v, ok := strings.Cut(h, ":")
+			if !ok || strings.TrimSpace(k) == "" {
+				return fmt.Errorf(`%q is not "Name: value"`, h)
+			}
+			req.Headers[strings.TrimSpace(k)] = strings.TrimSpace(v)
+			return nil
+		})
+		fs.StringVar(&req.Git, "git", "", "take a folder release from this git repository (folder apps)")
+		fs.StringVar(&req.Ref, "ref", "", "branch, tag or commit of the git repository (default: its HEAD)")
+		fs.StringVar(&req.Subdir, "subdir", "", "keep only this folder of the archive or repository (folder apps)")
+		fs.StringVar(&req.URL, "url", "", "download the binary, or for a folder app the archive, from this URL")
 		fs.StringVar(&req.Image, "image", "", "take the binary from this container image")
 		fs.StringVar(&req.Path, "path", "", "the binary's path inside the image")
-		fs.StringVar(&req.Username, "username", "", "registry user")
-		fs.StringVar(&req.Password, "password", "", "registry password")
+		fs.StringVar(&req.Username, "username", "", "user for a private image or git repository, or basic auth for a --url download")
+		fs.StringVar(&req.Password, "password", "", "password or token that goes with --username")
 		fs.StringVar(&req.Version, "version", "", "name of the new version (default: a timestamp)")
 		fs.StringVar(&req.SHA256, "sha256", "", "expected checksum")
 		noActivate := fs.Bool("no-activate", false, "store the version without switching to it")
@@ -102,22 +114,35 @@ func runClient(cmd string, args []string) error {
 		body, _ := json.Marshal(req)
 		return call(http.MethodPost, "/apps/"+app+"/releases", bytes.NewReader(body), "application/json")
 	case "upload":
-		if err := need(2, "<app> <file>"); err != nil {
+		if err := need(2, "<app> <file or folder>"); err != nil {
 			return err
 		}
 		fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 		ver := fs.String("version", defaultVersion(), "name of the new version")
 		sha := fs.String("sha256", "", "expected checksum")
 		noActivate := fs.Bool("no-activate", false, "store the version without switching to it")
+		subdir := fs.String("subdir", "", "keep only this folder of the archive (folder apps)")
 		if err := fs.Parse(args[2:]); err != nil {
 			return err
 		}
-		f, err := os.Open(arg(1))
+		st, err := os.Stat(arg(1))
 		if err != nil {
+			return err
+		}
+		var f io.ReadCloser
+		if st.IsDir() {
+			// A folder is sent as a tar.gz made on the way; a failure while reading it ends the upload.
+			pr, pw := io.Pipe()
+			go func() { pw.CloseWithError(tarGzDir(arg(1), pw)) }()
+			f = pr
+		} else if f, err = os.Open(arg(1)); err != nil {
 			return err
 		}
 		defer f.Close()
 		q := url.Values{}
+		if *subdir != "" {
+			q.Set("subdir", *subdir)
+		}
 		if *sha != "" {
 			q.Set("sha256", *sha)
 		}

@@ -24,8 +24,10 @@ var (
 
 // Release describes one stored version of an app's binary.
 type Release struct {
-	Version string    `json:"version"`
-	Size    int64     `json:"size"`
+	Version string `json:"version"`
+	Size    int64  `json:"size"`
+	// Files is the number of files in a folder release.
+	Files   int       `json:"files,omitempty"`
 	SHA256  string    `json:"sha256,omitempty"`
 	Source  string    `json:"source,omitempty"`
 	Created time.Time `json:"created"`
@@ -43,12 +45,19 @@ type releaseStore struct {
 	dir     string
 	binName string
 	builtin string
+	folder  bool // a version is a folder (releases/<version>/tree), not one file
 }
+
+// treeName is the folder inside a version's directory that holds the files of a folder release.
+const treeName = "tree"
 
 func newReleaseStore(dataDir string, cfg *AppConfig) (*releaseStore, error) {
 	s := &releaseStore{dir: filepath.Join(dataDir, cfg.Name), binName: "app", builtin: cfg.Binary}
 	if cfg.Binary != "" {
 		s.binName = filepath.Base(cfg.Binary)
+	}
+	if cfg.folderMode {
+		s.folder, s.builtin, s.binName = true, cfg.Folder, treeName
 	}
 	return s, os.MkdirAll(filepath.Join(s.dir, "releases"), 0o755)
 }
@@ -58,14 +67,14 @@ func (s *releaseStore) hasBuiltin() bool {
 		return false
 	}
 	st, err := os.Stat(s.builtin)
-	return err == nil && !st.IsDir()
+	return err == nil && st.IsDir() == s.folder
 }
 
-// binPath returns the file to execute for a version.
+// binPath returns what a version runs from: the binary of a file app, the folder of a folder app.
 func (s *releaseStore) binPath(version string) (string, error) {
 	if version == versionBuiltin {
 		if !s.hasBuiltin() {
-			return "", fmt.Errorf("no built-in binary at %q", s.builtin)
+			return "", fmt.Errorf("no built-in %s at %q", map[bool]string{false: "binary", true: "folder"}[s.folder], s.builtin)
 		}
 		return s.builtin, nil
 	}
@@ -104,9 +113,70 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	return os.Rename(tmp, path)
 }
 
-// add stores r as a new version. The file is written next to its final place and renamed in, so a half
-// written release is never visible. wantSHA, when set, must match the content.
-func (s *releaseStore) add(version, source string, r io.Reader, wantSHA string, maxBytes int64) (Release, error) {
+// add stores r as a new version: the binary itself for a file app, or an archive (tar, tar.gz, tar.bz2,
+// zip) that is unpacked for a folder app, keeping only what is under subdir. wantSHA, when set, must match
+// what was received.
+func (s *releaseStore) add(version, source string, r io.Reader, wantSHA string, maxBytes int64, subdir string) (Release, error) {
+	if !s.folder && subdir != "" {
+		return Release{}, errors.New("subdir is only for folder apps (a command with {dir}, or folder: in the config)")
+	}
+	return s.addWith(version, maxBytes, func(tmp string) (string, string, error) {
+		name := s.binName
+		if s.folder {
+			name = ".archive"
+		}
+		f, err := os.OpenFile(filepath.Join(tmp, name), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o755)
+		if err != nil {
+			return "", "", err
+		}
+		h := sha256.New()
+		n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(r, maxBytes+1))
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		what := map[bool]string{false: "binary", true: "archive"}[s.folder]
+		switch {
+		case err != nil:
+			return "", "", fmt.Errorf("receiving the %s: %w", what, err)
+		case n == 0:
+			return "", "", fmt.Errorf("the %s is empty", what)
+		case n > maxBytes:
+			return "", "", fmt.Errorf("the %s is larger than max_binary_bytes (%d)", what, maxBytes)
+		}
+		sum := hex.EncodeToString(h.Sum(nil))
+		if wantSHA != "" && !strings.EqualFold(wantSHA, sum) {
+			return "", "", fmt.Errorf("sha256 mismatch: got %s, want %s", sum, wantSHA)
+		}
+		if !s.folder {
+			return sum, source, nil
+		}
+		tree := filepath.Join(tmp, treeName)
+		if err := os.Mkdir(tree, 0o755); err != nil {
+			return "", "", err
+		}
+		if err := extractArchive(f.Name(), tree, subdir, maxBytes); err != nil {
+			return "", "", err
+		}
+		return sum, source, os.Remove(f.Name())
+	})
+}
+
+// addFolder stores a version that fill writes as a folder (a git checkout): fill puts the files in the
+// directory it is given and returns what to record as the source.
+func (s *releaseStore) addFolder(version string, maxBytes int64, fill func(tree string) (source string, err error)) (Release, error) {
+	if !s.folder {
+		return Release{}, errors.New("this source gives a folder, and the app runs a single binary (use {dir} in its command, or folder: in the config)")
+	}
+	return s.addWith(version, maxBytes, func(tmp string) (string, string, error) {
+		source, err := fill(filepath.Join(tmp, treeName))
+		return "", source, err
+	})
+}
+
+// addWith creates a version: fill writes its content into a temporary directory and says what it was (a
+// checksum, where it came from). The directory is renamed into place only when everything succeeded, so a
+// half written release is never visible.
+func (s *releaseStore) addWith(version string, maxBytes int64, fill func(tmp string) (sha, source string, err error)) (Release, error) {
 	if version == versionBuiltin || !nameRe.MatchString(version) {
 		return Release{}, fmt.Errorf("invalid version %q", version)
 	}
@@ -119,29 +189,18 @@ func (s *releaseStore) add(version, source string, r io.Reader, wantSHA string, 
 		return Release{}, err
 	}
 	defer os.RemoveAll(tmp)
-	f, err := os.OpenFile(filepath.Join(tmp, s.binName), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o755)
+	sum, source, err := fill(tmp)
 	if err != nil {
 		return Release{}, err
 	}
-	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(r, maxBytes+1))
-	if cerr := f.Close(); err == nil {
-		err = cerr
+	rel := Release{Version: version, SHA256: sum, Source: source, Created: time.Now().UTC()}
+	if s.folder {
+		if rel.Files, rel.Size, err = checkTree(filepath.Join(tmp, treeName), maxBytes); err != nil {
+			return Release{}, fmt.Errorf("the release cannot be used: %w", err)
+		}
+	} else if st, err := os.Stat(filepath.Join(tmp, s.binName)); err == nil {
+		rel.Size = st.Size()
 	}
-	if err != nil {
-		return Release{}, fmt.Errorf("receiving the binary: %w", err)
-	}
-	if n == 0 {
-		return Release{}, errors.New("the binary is empty")
-	}
-	if n > maxBytes {
-		return Release{}, fmt.Errorf("the binary is larger than max_binary_bytes (%d)", maxBytes)
-	}
-	sum := hex.EncodeToString(h.Sum(nil))
-	if wantSHA != "" && !strings.EqualFold(wantSHA, sum) {
-		return Release{}, fmt.Errorf("sha256 mismatch: got %s, want %s", sum, wantSHA)
-	}
-	rel := Release{Version: version, Size: n, SHA256: sum, Source: source, Created: time.Now().UTC()}
 	meta, _ := json.Marshal(rel)
 	if err := os.WriteFile(filepath.Join(tmp, "meta.json"), meta, 0o644); err != nil {
 		return Release{}, err
@@ -170,7 +229,11 @@ func (s *releaseStore) list(current string) []Release {
 	out := []Release{}
 	if s.hasBuiltin() {
 		st, _ := os.Stat(s.builtin)
-		out = append(out, Release{Version: versionBuiltin, Size: st.Size(), Source: s.builtin,
+		size := st.Size()
+		if s.folder {
+			size = 0 // not measured: it may be large, and it is not drover's
+		}
+		out = append(out, Release{Version: versionBuiltin, Size: size, Source: s.builtin,
 			Created: st.ModTime().UTC(), Current: current == versionBuiltin})
 	}
 	entries, _ := os.ReadDir(filepath.Join(s.dir, "releases"))

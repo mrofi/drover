@@ -27,7 +27,7 @@ var (
 
 // Variables drover sets for every instance. They cannot be changed from a file or the API.
 var reservedEnv = map[string]bool{"PORT": true, "DROVER_APP": true, "DROVER_INDEX": true,
-	"DROVER_VERSION": true, "DROVER_TOKEN": true}
+	"DROVER_VERSION": true, "DROVER_TOKEN": true, "DROVER_DIR": true}
 
 // envChange is a set of edits: variables to set and variables to remove.
 type envChange struct {

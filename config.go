@@ -47,6 +47,10 @@ type AppConfig struct {
 	Command Command `yaml:"command"`
 	// Binary is the file a release replaces. Default: the first word of Command.
 	Binary string `yaml:"binary"`
+	// Folder makes this a folder app: a release replaces a whole folder, {dir} in the command (and in dir
+	// and env values) is the folder of the version an instance runs, and it is the working directory.
+	// Folder itself is the built-in version; it may not exist yet.
+	Folder string `yaml:"folder"`
 	// Listen is the public address the load balancer serves on.
 	Listen    string `yaml:"listen"`
 	Instances int    `yaml:"instances"`
@@ -64,6 +68,7 @@ type AppConfig struct {
 	Dir     string `yaml:"dir"`
 
 	stopSignal syscall.Signal
+	folderMode bool
 }
 
 type HealthConfig struct {
@@ -233,13 +238,23 @@ func (a *AppConfig) normalize(index int) error {
 		return fmt.Errorf("port_base %d with %d instances is out of range", a.PortBase, a.Instances)
 	}
 	// The first word of the command is the updatable binary unless the command says where {bin} goes.
-	hasBin := false
+	// A folder app instead runs from a folder that versions replace as a whole: {dir}.
+	hasBin, hasDir := false, strings.Contains(a.Dir, "{dir}")
 	for _, w := range a.Command {
-		if strings.Contains(w, "{bin}") {
-			hasBin = true
-		}
+		hasBin = hasBin || strings.Contains(w, "{bin}")
+		hasDir = hasDir || strings.Contains(w, "{dir}")
 	}
-	if !hasBin {
+	a.folderMode = hasDir || a.Folder != ""
+	if a.folderMode {
+		if hasBin || a.Binary != "" {
+			return errors.New("a folder app (folder: or {dir}) cannot also use binary: or {bin}")
+		}
+		if a.Folder != "" {
+			if abs, err := filepath.Abs(a.Folder); err == nil {
+				a.Folder = abs
+			}
+		}
+	} else if !hasBin {
 		if a.Binary == "" {
 			a.Binary = a.Command[0]
 		}

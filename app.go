@@ -138,12 +138,19 @@ func (a *App) spawn(slot int, version string) (*proc, error) {
 	if port == 0 {
 		return nil, fmt.Errorf("no free port in %d-%d", a.cfg.PortBase, a.cfg.PortBase+2*a.cfg.Instances-1)
 	}
-	repl := strings.NewReplacer("{bin}", bin, "{port}", strconv.Itoa(port), "{index}", strconv.Itoa(slot))
+	repl := strings.NewReplacer("{bin}", bin, "{dir}", bin, "{port}", strconv.Itoa(port), "{index}", strconv.Itoa(slot))
 	argv := make([]string, len(a.cfg.Command))
 	for i, w := range a.cfg.Command {
 		argv[i] = repl.Replace(w)
 	}
 	p := newProc(a, slot, port, version, argv, a.instanceEnv(fileVars))
+	p.repl, p.workdir = repl, repl.Replace(a.cfg.Dir)
+	if a.cfg.folderMode {
+		p.release = bin
+		if p.workdir == "" {
+			p.workdir = bin
+		}
+	}
 	a.ports[port] = true
 	a.procs[p] = true
 	go p.run()
@@ -368,6 +375,8 @@ type AppStatus struct {
 	Version  string `json:"version"`
 	Previous string `json:"previous,omitempty"`
 	Rolling  bool   `json:"rolling"`
+	// Folder: versions of this app are folders, not single binaries.
+	Folder bool `json:"folder,omitempty"`
 	// EnvPending: the stored environment differs from what the running instances were started with.
 	EnvPending bool `json:"env_pending,omitempty"`
 	// EnvOverrides are the names of variables set through the API. They are lost when drover restarts.
@@ -380,7 +389,7 @@ func (a *App) status() AppStatus {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	st := AppStatus{Name: a.cfg.Name, Listen: a.cfg.Listen, Version: a.version, Previous: a.previous,
-		Rolling: a.rolling.Load()}
+		Rolling: a.rolling.Load(), Folder: a.cfg.folderMode}
 	for k := range a.overrides {
 		st.EnvOverrides = append(st.EnvOverrides, k)
 	}
