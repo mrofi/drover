@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -78,7 +79,12 @@ func (u *unpacker) file(rel string, mode fs.FileMode, r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	n, err := io.Copy(f, io.LimitReader(r, u.maxBytes-u.written+1))
+	// One byte over what is left, to notice going over; without overflowing when there is no real limit.
+	limit := u.maxBytes - u.written
+	if limit < math.MaxInt64 {
+		limit++
+	}
+	n, err := io.Copy(f, io.LimitReader(r, limit))
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}

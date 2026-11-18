@@ -94,7 +94,8 @@ func runServer(args []string) error {
 	envFile := fs.String("env-file", "", "KEY=VALUE file read at every instance start (without -c)")
 	health := fs.String("health", "", "health check path; empty checks that the port accepts connections (without -c)")
 	admin := fs.String("admin", os.Getenv("DROVER_ADMIN_LISTEN"), "admin API address (default 127.0.0.1:9100; also DROVER_ADMIN_LISTEN)")
-	data := fs.String("data", "", "where releases are kept")
+	data := fs.String("data", "", "where releases are kept (also DROVER_DATA)")
+	cache := fs.String("cache", "", "where folder versions are unpacked (also DROVER_CACHE; default ~/.cache/drover)")
 	manage := fs.Bool("manage-apps", false, "allow adding and removing apps through the API (also DROVER_MANAGE_APPS=1)")
 	metrics := fs.String("metrics", "", "extra address that serves only /metrics, without a token (e.g. :9101)")
 	if err := fs.Parse(args); err != nil {
@@ -139,6 +140,9 @@ func runServer(args []string) error {
 	}
 	if *data != "" {
 		cfg.Data = *data
+	}
+	if *cache != "" {
+		cfg.Cache = *cache
 	}
 	d, err := newDrover(cfg)
 	if err != nil {

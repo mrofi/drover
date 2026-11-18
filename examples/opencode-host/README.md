@@ -75,10 +75,12 @@ docker exec ocd drover rollback web                                            #
 
 - **The app port has no password.** opencode's password protects 8080 only. Publish 8090 only where the app
   may be reached, or put your own proxy with authentication in front of it.
-- **Deployed versions are not in the backup.** opencode-host backs up opencode's own data, config and state
-  to S3. drover keeps versions in `/home/node/.local/share/drover`, which is outside that. After the
-  container is recreated the app is empty again until the next upload. To keep them, mount a volume there:
-  `-v drover-data:/home/node/.local/share/drover`.
+- **Deployed versions are backed up with opencode's state.** The Dockerfile sets
+  `BACKUP_EXTRA_DIRS="drover=/home/node/.local/share/drover"`, so when the S3 backup is on, drover's data
+  directory goes to `extra/drover` in the bucket and comes back before drover starts. A recreated
+  container serves the version it had. Without a bucket there is no backup, and the app is empty again
+  until the next upload. This needs an opencode-host image with `BACKUP_EXTRA_DIRS`.
+- **Every version is in the bucket.** Delete old ones with `drover rm web <version>` to keep it small.
 - **A failing hook does not stop opencode.** opencode-host logs it and carries on. If the app port does not
   answer at all, look for `[entrypoint] hook 20-drover.sh` and drover's lines in `docker logs ocd`.
 - **The agent can deploy.** With `AGENTS.d/20-drover.md` in place it can replace what port 8090 serves. That
@@ -91,5 +93,10 @@ the boot hook started drover, opencode answered 401 without and 200 with the pas
 uploaded, 300 requests during a rollout and a rollback all returned 200, a killed instance came back, and
 the shutdown hook stopped drover on `docker stop`.
 
-Not tested: with an S3 bucket configured, with a volume on the drover data directory, and with a binary
+Backup of drover's data directory, built on local images of drover and of opencode-host with
+`BACKUP_EXTRA_DIRS`, against a local directory as the backup target with encryption on: a binary version and
+a folder version (with a symlink and a lock file) were uploaded, the container was stopped and deleted, and
+a new one started from the backup served both, healthy, with the folder intact.
+
+Not tested: a real S3 bucket, and a binary
 that the agent itself built.

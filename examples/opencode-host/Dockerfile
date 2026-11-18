@@ -8,5 +8,9 @@ COPY --chown=node:node entrypoint.d/ /home/node/entrypoint.d/
 COPY --chown=node:node shutdown.d/   /home/node/shutdown.d/
 COPY --chown=node:node AGENTS.d/     /home/node/config/AGENTS.d/
 
+# drover's data directory (versions, apps added through the API) is backed up to S3 with opencode's own
+# state and restored before the boot hooks run. It holds plain files only, so the S3 copy is complete.
+ENV BACKUP_EXTRA_DIRS="drover=/home/node/.local/share/drover"
+
 USER node
 EXPOSE 8090

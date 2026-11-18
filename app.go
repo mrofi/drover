@@ -46,8 +46,8 @@ type App struct {
 	addr    net.Addr
 }
 
-func newApp(cfg *AppConfig, dataDir string, logLines int) (*App, error) {
-	store, err := newReleaseStore(dataDir, cfg)
+func newApp(cfg *AppConfig, dataDir, cacheDir string, logLines int) (*App, error) {
+	store, err := newReleaseStore(dataDir, cacheDir, cfg)
 	if err != nil {
 		return nil, err
 	}

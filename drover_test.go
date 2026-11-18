@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -40,6 +41,8 @@ func TestMain(m *testing.M) {
 			panic(fmt.Sprintf("building fakeapp: %v\n%s", err, out))
 		}
 	}
+	// Never the real ~/.cache of whoever runs the tests.
+	os.Setenv("DROVER_CACHE", filepath.Join(dir, "cache"))
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)
@@ -69,6 +72,7 @@ func startDrover(t *testing.T, mutate func(*Config)) *harness {
 	}
 	cfg := &Config{
 		Data:  t.TempDir(),
+		Cache: t.TempDir(),
 		Admin: AdminConfig{Listen: "127.0.0.1:0"},
 		Apps: []*AppConfig{{
 			Name: "web", Command: Command{builtin, "--port", "{port}"}, Listen: "127.0.0.1:0",
@@ -887,6 +891,16 @@ func zipOf(t *testing.T, entries ...entry) []byte {
 	return buf.Bytes()
 }
 
+// tree returns where a folder version of the app "web" is unpacked, unpacking it if needed.
+func (h *harness) tree(version string) string {
+	h.t.Helper()
+	p, err := h.d.findApp("web").store.binPath(version)
+	if err != nil {
+		h.t.Fatalf("version %s: %v", version, err)
+	}
+	return p
+}
+
 // launcher is a small script that becomes the test app: the "server" of a folder release, without putting
 // a whole binary into every test archive.
 func launcher(bin string) string { return "#!/bin/sh\nexec " + bin + " \"$@\"\n" }
@@ -940,7 +954,7 @@ func TestFolderReleases(t *testing.T) {
 	if code != 200 || !strings.Contains(body, `"folder":true`) {
 		t.Fatalf("upload tar.gz: %d %s", code, body)
 	}
-	dir := filepath.Join(h.d.cfg.Data, "web", "releases", "v2", "tree")
+	dir := h.tree("v2")
 	if h.body("/file?name=version.txt") != "two" || h.body("/file?name=static/app.js") != "js" ||
 		h.body("/file?name=current.txt") != "two" || h.body("/cwd") != dir {
 		t.Fatalf("v2 folder is not what was uploaded (cwd %s)", h.body("/cwd"))
@@ -968,7 +982,7 @@ func TestFolderReleases(t *testing.T) {
 	if h.body("/file?name=version.txt") != "three" {
 		t.Fatal("v3 is not the subfolder of the zip")
 	}
-	if _, err := os.Stat(filepath.Join(h.d.cfg.Data, "web", "releases", "v3", "tree", "README.md")); err == nil {
+	if _, err := os.Stat(filepath.Join(h.tree("v3"), "README.md")); err == nil {
 		t.Fatal("a file outside subdir was kept")
 	}
 
@@ -1011,7 +1025,7 @@ func TestFolderArchivesThatAreRefused(t *testing.T) {
 	// Names that try to leave the folder are kept inside it; nothing is written outside.
 	sneaky := tarOf(t, false, entry{name: "../../escaped", body: "x"}, entry{name: "/abs", body: "y"})
 	code, body := h.do(http.MethodPut, "/apps/web/releases/sneaky?activate=false", bytes.NewReader(sneaky))
-	tree := filepath.Join(h.d.cfg.Data, "web", "releases", "sneaky", "tree")
+	tree := h.tree("sneaky")
 	if _, err := os.Stat(filepath.Join(tree, "escaped")); code != 201 || err != nil {
 		t.Fatalf("sneaky names: %d %s (%v)", code, body, err)
 	}
@@ -1087,7 +1101,7 @@ func TestFolderFromGitImageAndURL(t *testing.T) {
 	if h.body("/file?name=version.txt") != "git-second" {
 		t.Fatal("git HEAD did not give the latest commit")
 	}
-	tree := filepath.Join(h.d.cfg.Data, "web", "releases", "head", "tree")
+	tree := h.tree("head")
 	for _, gone := range []string{".git", "README.md", "build"} {
 		if _, err := os.Stat(filepath.Join(tree, gone)); err == nil {
 			t.Fatalf("%s is in the release, outside the subdir", gone)
@@ -1442,5 +1456,142 @@ func TestAppsThroughTheAPIOffByDefaultAndConfigWins(t *testing.T) {
 	}
 	if err := (&Config{Data: t.TempDir(), Admin: AdminConfig{ManageApps: true}}).normalize(); err != nil {
 		t.Fatalf("no apps with the switch on: %v", err)
+	}
+}
+
+// copyPlain copies a directory the way a copy that keeps no file modes and no links does (rclone to S3):
+// every file arrives as 0644, links are left out.
+func copyPlain(t *testing.T, src, dst string) {
+	t.Helper()
+	err := filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(src, p)
+		target := filepath.Join(dst, rel)
+		switch {
+		case d.IsDir():
+			return os.MkdirAll(target, 0o755)
+		case d.Type().IsRegular():
+			raw, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(target, raw, 0o644)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDataDirectoryCopiedPlainlyRunsEveryVersion(t *testing.T) {
+	// A file app and a folder app, each on an uploaded version.
+	h, _ := startFolderApp(t, func(c *Config) {
+		raw, _ := os.ReadFile(binV1)
+		bin := filepath.Join(t.TempDir(), "plain")
+		os.WriteFile(bin, raw, 0o755)
+		c.Apps = append(c.Apps, &AppConfig{Name: "bin", Command: Command{bin, "--port", "{port}"}, Listen: "127.0.0.1:0",
+			Instances: 1, PortBase: int(nextBase.Add(20)), Health: HealthConfig{Path: "/health", Interval: 100 * time.Millisecond}})
+	})
+	site := tarOf(t, true, entry{name: "server", body: launcher(binV2), mode: 0o755},
+		entry{name: "version.txt", body: "restored"}, entry{name: "current.txt", link: "version.txt"},
+		entry{name: "composer.lock", body: "{}"})
+	if code, body := h.do(http.MethodPut, "/apps/web/releases/site1", bytes.NewReader(site)); code != 200 {
+		t.Fatalf("upload folder: %d %s", code, body)
+	}
+	f, _ := os.Open(binV2)
+	defer f.Close()
+	if code, body := h.do(http.MethodPut, "/apps/bin/releases/b2", f); code != 200 {
+		t.Fatalf("upload binary: %d %s", code, body)
+	}
+	// The data directory holds only plain files: no links, nothing unpacked.
+	filepath.WalkDir(h.d.cfg.Data, func(p string, d fs.DirEntry, _ error) error {
+		if d != nil && !d.IsDir() && !d.Type().IsRegular() {
+			t.Errorf("not a plain file in the data directory: %s", p)
+		}
+		if d != nil && d.IsDir() && d.Name() == treeName {
+			t.Errorf("an unpacked folder in the data directory: %s", p)
+		}
+		return nil
+	})
+	h.d.stop()
+
+	// A new container: the data directory comes back without modes or links, the cache is empty.
+	cfg := h.d.cfg
+	restored := t.TempDir()
+	copyPlain(t, cfg.Data, restored)
+	cfg.Data, cfg.Cache = restored, t.TempDir()
+	cfg.Apps[0].PortBase, cfg.Apps[1].PortBase = int(nextBase.Add(20)), int(nextBase.Add(20))
+	d, err := newDrover(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.start(); err != nil {
+		t.Fatal(err)
+	}
+	defer d.stop()
+	h2 := &harness{t: t, d: d, app: "http://" + d.apps[0].addr.String(), admin: "http://" + d.adminAddr.String()}
+	h2.waitFor("both apps on their versions", func() bool {
+		web, _ := h2.appStatus("web")
+		bin, _ := h2.appStatus("bin")
+		return web.Version == "site1" && bin.Version == "b2" && len(web.Instances) == 2 &&
+			web.Instances[0].State == "healthy" && len(bin.Instances) == 1 && bin.Instances[0].State == "healthy"
+	})
+	if h2.body("/file?name=current.txt") != "restored" || h2.body("/file?name=composer.lock") != "{}" {
+		t.Fatal("the folder version lost its link or its lock file")
+	}
+	bin, _ := h2.appStatus("bin")
+	if code, body := getVia(bin.Listen, "/"); code != 200 || !strings.HasPrefix(body, "v2 ") {
+		t.Fatalf("the binary version does not run: %d %s", code, body)
+	}
+	// Deleting a version also deletes its unpacked folder.
+	tree := h2.tree("site1")
+	h2.do(http.MethodPost, "/apps/web/rollback", nil)
+	if code, _ := h2.do(http.MethodDelete, "/apps/web/releases/site1", nil); code != 204 {
+		t.Fatalf("delete: %d", code)
+	}
+	if _, err := os.Stat(tree); err == nil {
+		t.Fatal("the unpacked folder of a deleted version is still in the cache")
+	}
+}
+
+func TestOldUnpackedFolderVersionsAreMovedToArchives(t *testing.T) {
+	data, cache := t.TempDir(), t.TempDir()
+	old := filepath.Join(data, "web", "releases", "v1")
+	os.MkdirAll(filepath.Join(old, treeName, "sub"), 0o755)
+	os.WriteFile(filepath.Join(old, treeName, "sub", "f.txt"), []byte("kept"), 0o644)
+	os.Symlink("sub/f.txt", filepath.Join(old, treeName, "link"))
+	os.WriteFile(filepath.Join(old, "meta.json"), []byte(`{"version":"v1","files":1}`), 0o644)
+	cfg := &AppConfig{Name: "web", Command: Command{"{dir}/x"}, Listen: ":1"}
+	if err := cfg.normalize(0); err != nil {
+		t.Fatal(err)
+	}
+	s, err := newReleaseStore(data, cache, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(old, treeName)); err == nil {
+		t.Fatal("the unpacked folder is still in the data directory")
+	}
+	tree, err := s.binPath("v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(tree, "link")); string(raw) != "kept" || !strings.HasPrefix(tree, cache) {
+		t.Fatalf("migrated version at %s reads %q", tree, raw)
+	}
+}
+
+func TestExtractWithoutALimitKeepsContent(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "a.tar")
+	os.WriteFile(archive, tarOf(t, false, entry{name: "f", body: "content"}), 0o644)
+	dest := t.TempDir()
+	if err := extractArchive(archive, dest, "", math.MaxInt64); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(dest, "f")); string(raw) != "content" {
+		t.Fatalf("unpacked with no limit: %q", raw)
 	}
 }

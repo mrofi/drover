@@ -1,8 +1,13 @@
 # Every key except apps[].name, command and listen is optional; the values shown are the defaults.
 
-# Where releases and the current version of each app are kept. Put it on a volume to keep them across
-# container restarts. Also DROVER_DATA. Default: $HOME/.local/share/drover (no ~ expansion here).
+# Where releases and the current version of each app are kept: plain files only, so a copy of it by any
+# tool is a complete backup. Put it on a volume, or back it up, to keep them across container restarts.
+# Also DROVER_DATA. Default: $HOME/.local/share/drover (no ~ expansion here).
 data: /home/app/.local/share/drover
+
+# Where folder versions are unpacked. Rebuilt from the data directory when missing: no backup needed.
+# Also DROVER_CACHE. Default: $HOME/.cache/drover.
+cache: /home/app/.cache/drover
 
 admin:
   # Also the --admin flag, or DROVER_ADMIN_LISTEN; both win over this file.

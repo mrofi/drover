@@ -17,8 +17,11 @@ import (
 
 // Config is the whole drover configuration: one admin API and one or more apps.
 type Config struct {
-	// Data is where releases and the current/previous version of each app are kept.
-	Data  string      `yaml:"data"`
+	// Data is where releases and the current/previous version of each app are kept. It holds plain files
+	// only, so copying it is a complete backup.
+	Data string `yaml:"data"`
+	// Cache holds folder versions unpacked, rebuilt from the data directory when missing. Not worth a backup.
+	Cache string      `yaml:"cache"`
 	Admin AdminConfig `yaml:"admin"`
 	// ImageFetchURL is the base URL of an image-file-fetch server, used for {"image": ..., "path": ...} sources.
 	ImageFetchURL string `yaml:"image_fetch_url"`
@@ -176,6 +179,19 @@ func (c *Config) normalize() error {
 		} else {
 			c.Data = filepath.Join(os.TempDir(), "drover")
 		}
+	}
+	if v := os.Getenv("DROVER_CACHE"); v != "" && c.Cache == "" {
+		c.Cache = v
+	}
+	if c.Cache == "" {
+		if dir, err := os.UserCacheDir(); err == nil && dir != "" && !strings.HasPrefix(dir, "/.") {
+			c.Cache = filepath.Join(dir, "drover")
+		} else {
+			c.Cache = filepath.Join(os.TempDir(), "drover-cache")
+		}
+	}
+	if abs, err := filepath.Abs(c.Cache); err == nil {
+		c.Cache = abs
 	}
 	if v := os.Getenv("DROVER_TOKEN"); v != "" {
 		c.Admin.Token = v

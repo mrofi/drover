@@ -203,7 +203,7 @@ func (d *Drover) loadManaged() error {
 			log.Printf("[drover] app %q from the API is not started: %v", spec.Name, err)
 			continue
 		}
-		a, err := newApp(cfg, d.cfg.Data, d.cfg.LogLines)
+		a, err := newApp(cfg, d.cfg.Data, d.cfg.Cache, d.cfg.LogLines)
 		if err != nil {
 			log.Printf("[drover] app %q from the API is not started: %v", spec.Name, err)
 			continue
@@ -243,7 +243,7 @@ func (d *Drover) addApp(spec appSpec) (*App, error) {
 	}
 	dataDir := filepath.Join(d.cfg.Data, cfg.Name)
 	_, statErr := os.Stat(dataDir)
-	a, err := newApp(cfg, d.cfg.Data, d.cfg.LogLines)
+	a, err := newApp(cfg, d.cfg.Data, d.cfg.Cache, d.cfg.LogLines)
 	if err != nil {
 		return nil, err
 	}
@@ -308,6 +308,7 @@ func (d *Drover) removeApp(name string, purge bool) error {
 		log.Printf("[%s] removed through the API", name)
 	}
 	if purge {
+		_ = os.RemoveAll(filepath.Join(d.cfg.Cache, name))
 		if err := os.RemoveAll(filepath.Join(d.cfg.Data, name)); err != nil {
 			return fmt.Errorf("the app is removed, but its versions could not be deleted: %w", err)
 		}

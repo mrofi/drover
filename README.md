@@ -37,7 +37,7 @@ flowchart LR
 - **Roll back.** Every version is kept under the name you gave it. Switch to any of them, or back to the one
   from before, the same way.
 - **Observe.** Recent output of every instance over HTTP, and Prometheus metrics.
-- **No root.** It writes only to its data directory and uses no privileged calls. Linux only.
+- **No root.** It writes only to its data and cache directories and uses no privileged calls. Linux only.
 
 **Contents:** [Quick start](#quick-start) · [Moving an existing command](#moving-an-existing-command-to-drover) ·
 [Updating the binary](#updating-the-binary) ·
@@ -249,7 +249,7 @@ not start is not activated, every version stays for `activate` and `rollback`.
 - **The folder has to be complete.** drover does not build: run `composer install`, `npm ci`, `pip install`
   in CI and ship the result. Packages with compiled parts must be built for the container's OS, CPU and
   interpreter version; the easy way is to build inside the image you deploy.
-- **Its path changes with every version** (`<data>/<app>/releases/<version>/tree`). The app must not store
+- **Its path changes with every version** (`<cache>/<app>/<version>-<id>`). The app must not store
   its own absolute path, and what it writes (uploads, SQLite, sessions) belongs outside the folder, or it
   is gone with the next version.
 - **git** needs the `git` command in the container. Only `http(s)` URLs; for a private repository give
@@ -345,7 +345,7 @@ exit 1. Response codes and JSON shapes are in [`llms.txt`](llms.txt).
 `drover run` takes either flags and a command (one app), or `-c drover.yaml`
 ([every key](drover.example.yaml)). Flags, for the one-app form: `--name` `--listen` `--instances`
 `--port-base` `--health` `--env-file` `--folder`. For both forms: `--admin` `--metrics` `--data`
-`--manage-apps`.
+`--cache` `--manage-apps`.
 
 | Variable | Read by | Meaning |
 |---|---|---|
@@ -353,6 +353,7 @@ exit 1. Response codes and JSON shapes are in [`llms.txt`](llms.txt).
 | `DROVER_ADMIN_LISTEN` | server | Admin API address. Order: `--admin`, this, `admin.listen`, `127.0.0.1:9100`. |
 | `DROVER_TOKEN` | server, client | Admin API token. On the server it wins over `admin.token`. |
 | `DROVER_DATA` | server | Data directory, when `data:` and `--data` are not set. Default `~/.local/share/drover`. |
+| `DROVER_CACHE` | server | Where folder versions are unpacked, when `cache:` and `--cache` are not set. Default `~/.cache/drover`. |
 | `DROVER_IMAGE_FETCH_URL` | server | image-file-fetch server for image sources. Wins over `image_fetch_url`. |
 | `DROVER_MANAGE_APPS` | server | `1` or `true`: allow adding and removing apps through the API. |
 | `DROVER_ADMIN` | client | URL of the admin API, default `http://127.0.0.1:9100`. |
@@ -467,11 +468,17 @@ ADD --chmod=755 https://github.com/mrofi/drover/releases/latest/download/drover-
 
 A complete example is in [`examples/inject`](examples/inject).
 
-- **State.** Releases and the current version live in the data directory. Put it on a volume and a
-  restarted container comes back on the version it was running. Without a volume it starts on `builtin`
-  again.
-- **Read-only root filesystem.** Point the data directory at a writable mount that allows execution
-  (`--tmpfs /tmp:exec` with `DROVER_DATA=/tmp/drover`).
+- **State.** Releases, the current version and apps added through the API live in the data directory. Put
+  it on a volume, or back it up, and a restarted container comes back as it was. Without either it starts
+  on `builtin` again.
+- **Backing up the data directory.** It holds plain files only: a binary per file version, one
+  `tree.tar.gz` per folder version, and small JSON records. So any copy brings everything back, even one
+  that keeps neither file modes nor links (rclone to S3, for one): drover sets the executable bit of a
+  binary again, and a folder's modes, links and lock files are inside its archive. Folder versions are
+  unpacked into the **cache directory** (`cache:`, `--cache`, `DROVER_CACHE`; default `~/.cache/drover`),
+  which needs no backup: a missing folder is unpacked again from its archive when it is first run.
+- **Read-only root filesystem.** Point the data and cache directories at a writable mount that allows
+  execution (`--tmpfs /tmp:exec` with `DROVER_DATA=/tmp/drover DROVER_CACHE=/tmp/drover-cache`).
 - **Beside another main process.** Start `drover run ... &` from the image's own entrypoint or hook.
   [`examples/opencode-host`](examples/opencode-host) does this for
   [opencode-host](https://github.com/mrofi/opencode-host): opencode keeps port 8080, the app is on 8090, and
@@ -647,6 +654,8 @@ a GitHub release.
   runs them concurrently.
 - **`DROVER_ADMIN_LISTEN` in the test suite.** Its order against the flag and the config was checked by
   hand only.
+- **Large folder versions after a restore.** Each is unpacked again on first run, which takes time for
+  tens of thousands of files; nothing was measured.
 - **A volume on the data directory in a container.** Keeping the version across a restart of drover is
   tested as a process, not with a mounted volume.
 - **`examples/opencode-host` with the current binary.** It was built and run before logs and metrics were
@@ -676,7 +685,8 @@ a GitHub release.
   public GitHub repository; `--admin` and
   `DROVER_ADMIN_LISTEN`; the `examples/inject` image as uid 1000 on a read-only root filesystem with all
   capabilities dropped; the `examples/opencode-host` image (boot hook, first release, rollout under load,
-  rollback, crash restart, shutdown hook).
+  rollback, crash restart, shutdown hook), and its data directory going through opencode-host's encrypted
+  backup into a new container, where a binary and a folder version both ran again.
 
 ## License
 

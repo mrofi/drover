@@ -35,7 +35,7 @@ func newDrover(cfg *Config) (*Drover, error) {
 	d := &Drover{cfg: cfg, fetcher: &http.Client{Timeout: 30 * time.Minute}, done: make(chan struct{}),
 		specs: map[string]appSpec{}}
 	for _, ac := range cfg.Apps {
-		a, err := newApp(ac, cfg.Data, cfg.LogLines)
+		a, err := newApp(ac, cfg.Data, cfg.Cache, cfg.LogLines)
 		if err != nil {
 			return nil, fmt.Errorf("app %q: %w", ac.Name, err)
 		}

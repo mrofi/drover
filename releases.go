@@ -1,16 +1,20 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,7 +31,10 @@ type Release struct {
 	Version string `json:"version"`
 	Size    int64  `json:"size"`
 	// Files is the number of files in a folder release.
-	Files   int       `json:"files,omitempty"`
+	Files int `json:"files,omitempty"`
+	// ID tells apart two folder versions with the same name (one deleted, another added, or a backup of
+	// another drover restored): it names the version's unpacked folder in the cache.
+	ID      string    `json:"id,omitempty"`
 	SHA256  string    `json:"sha256,omitempty"`
 	Source  string    `json:"source,omitempty"`
 	Created time.Time `json:"created"`
@@ -41,25 +48,101 @@ type releaseState struct {
 
 // releaseStore keeps an app's releases on disk: <dir>/releases/<version>/<binary name> plus meta.json,
 // and <dir>/state.json with the current and previous version.
+//
+// Everything under <dir> is a plain file, so a copy of the data directory by any tool (a volume backup,
+// rclone to S3) is enough to bring every version back, even one that keeps neither file modes nor links.
+// A folder version is kept there as one archive, tree.tar.gz, and unpacked into the cache when it runs.
 type releaseStore struct {
 	dir     string
+	cache   string // <cache>/<app>: unpacked folder versions, rebuilt from their archives when missing
 	binName string
 	builtin string
-	folder  bool // a version is a folder (releases/<version>/tree), not one file
+	folder  bool
+	mu      sync.Mutex // one unpacking at a time
 }
 
-// treeName is the folder inside a version's directory that holds the files of a folder release.
-const treeName = "tree"
+const (
+	// treeName is the folder a folder version is unpacked into while it is being added.
+	treeName = "tree"
+	// archiveName is the file that keeps a folder version in the data directory.
+	archiveName = "tree.tar.gz"
+)
 
-func newReleaseStore(dataDir string, cfg *AppConfig) (*releaseStore, error) {
-	s := &releaseStore{dir: filepath.Join(dataDir, cfg.Name), binName: "app", builtin: cfg.Binary}
+func newReleaseStore(dataDir, cacheDir string, cfg *AppConfig) (*releaseStore, error) {
+	s := &releaseStore{dir: filepath.Join(dataDir, cfg.Name), cache: filepath.Join(cacheDir, cfg.Name),
+		binName: "app", builtin: cfg.Binary}
 	if cfg.Binary != "" {
 		s.binName = filepath.Base(cfg.Binary)
 	}
 	if cfg.folderMode {
-		s.folder, s.builtin, s.binName = true, cfg.Folder, treeName
+		s.folder, s.builtin, s.binName = true, cfg.Folder, archiveName
 	}
-	return s, os.MkdirAll(filepath.Join(s.dir, "releases"), 0o755)
+	if err := os.MkdirAll(filepath.Join(s.dir, "releases"), 0o755); err != nil {
+		return nil, err
+	}
+	if s.folder {
+		s.migrate()
+	}
+	return s, nil
+}
+
+func newID() string {
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func (s *releaseStore) meta(version string) Release {
+	var rel Release
+	if raw, err := os.ReadFile(filepath.Join(s.dir, "releases", version, "meta.json")); err == nil {
+		_ = json.Unmarshal(raw, &rel)
+	}
+	return rel
+}
+
+func (s *releaseStore) treePath(version string) string {
+	return filepath.Join(s.cache, version+"-"+s.meta(version).ID)
+}
+
+// migrate turns folder versions that drover 0.3 kept unpacked in the data directory into archives.
+func (s *releaseStore) migrate() {
+	entries, _ := os.ReadDir(filepath.Join(s.dir, "releases"))
+	for _, e := range entries {
+		dir := filepath.Join(s.dir, "releases", e.Name())
+		tree := filepath.Join(dir, treeName)
+		if st, err := os.Stat(tree); err != nil || !st.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		err := func() error {
+			f, err := os.CreateTemp(dir, ".archive-")
+			if err != nil {
+				return err
+			}
+			defer os.Remove(f.Name())
+			if err := tarGzDir(tree, f); err != nil {
+				f.Close()
+				return err
+			}
+			if err := f.Close(); err != nil {
+				return err
+			}
+			rel := s.meta(e.Name())
+			if rel.ID == "" {
+				rel.ID = newID()
+				raw, _ := json.Marshal(rel)
+				if err := writeFileAtomic(filepath.Join(dir, "meta.json"), raw, 0o644); err != nil {
+					return err
+				}
+			}
+			if err := os.Rename(f.Name(), filepath.Join(dir, archiveName)); err != nil {
+				return err
+			}
+			return os.RemoveAll(tree)
+		}()
+		if err != nil {
+			log.Printf("[%s] version %s could not be moved to an archive: %v", filepath.Base(s.dir), e.Name(), err)
+		}
+	}
 }
 
 func (s *releaseStore) hasBuiltin() bool {
@@ -78,14 +161,58 @@ func (s *releaseStore) binPath(version string) (string, error) {
 		}
 		return s.builtin, nil
 	}
-	if !nameRe.MatchString(version) {
-		return "", fmt.Errorf("invalid version %q", version)
-	}
-	p := filepath.Join(s.dir, "releases", version, s.binName)
-	if _, err := os.Stat(p); err != nil {
+	if !s.exists(version) {
 		return "", errNotFound
 	}
-	return p, nil
+	p := filepath.Join(s.dir, "releases", version, s.binName)
+	if !s.folder {
+		// A copy that does not keep file modes (rclone to S3, say) loses the executable bit.
+		if st, err := os.Stat(p); err == nil && st.Mode().Perm()&0o100 == 0 {
+			if err := os.Chmod(p, st.Mode().Perm()|0o755); err != nil {
+				return "", err
+			}
+		}
+		return p, nil
+	}
+	return s.unpack(version)
+}
+
+// exists reports whether a stored version is there, without unpacking it.
+func (s *releaseStore) exists(version string) bool {
+	if !nameRe.MatchString(version) || version == versionBuiltin {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(s.dir, "releases", version, s.binName))
+	return err == nil
+}
+
+// unpack returns the unpacked folder of a folder version, unpacking its archive into the cache first when
+// it is not there (a new container, a cleared cache, a restored backup).
+func (s *releaseStore) unpack(version string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tree := s.treePath(version)
+	if st, err := os.Stat(tree); err == nil && st.IsDir() {
+		return tree, nil
+	}
+	if err := os.MkdirAll(s.cache, 0o755); err != nil {
+		return "", err
+	}
+	tmp, err := os.MkdirTemp(s.cache, ".unpack-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp)
+	if err := extractArchive(filepath.Join(s.dir, "releases", version, archiveName), tmp, "", math.MaxInt64); err != nil {
+		return "", fmt.Errorf("version %s: %w", version, err)
+	}
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, tree); err != nil {
+		return "", err
+	}
+	return tree, nil
 }
 
 func (s *releaseStore) loadState() releaseState {
@@ -195,9 +322,14 @@ func (s *releaseStore) addWith(version string, maxBytes int64, fill func(tmp str
 	}
 	rel := Release{Version: version, SHA256: sum, Source: source, Created: time.Now().UTC()}
 	if s.folder {
-		if rel.Files, rel.Size, err = checkTree(filepath.Join(tmp, treeName), maxBytes); err != nil {
+		tree := filepath.Join(tmp, treeName)
+		if rel.Files, rel.Size, err = checkTree(tree, maxBytes); err != nil {
 			return Release{}, fmt.Errorf("the release cannot be used: %w", err)
 		}
+		if err := s.archive(tree, filepath.Join(tmp, archiveName)); err != nil {
+			return Release{}, fmt.Errorf("keeping the release: %w", err)
+		}
+		rel.ID = newID()
 	} else if st, err := os.Stat(filepath.Join(tmp, s.binName)); err == nil {
 		rel.Size = st.Size()
 	}
@@ -208,7 +340,21 @@ func (s *releaseStore) addWith(version string, maxBytes int64, fill func(tmp str
 	if err := os.Chmod(tmp, 0o755); err != nil {
 		return Release{}, err
 	}
+	// The unpacked folder goes to the cache, ready to run. Where the cache is on another file system the
+	// rename fails, and the folder is unpacked from the archive the first time it runs instead.
+	moved := ""
+	if s.folder {
+		tree, cached := filepath.Join(tmp, treeName), filepath.Join(s.cache, version+"-"+rel.ID)
+		if os.MkdirAll(s.cache, 0o755) == nil && os.Rename(tree, cached) == nil {
+			moved = cached
+		} else if err := os.RemoveAll(tree); err != nil {
+			return Release{}, err
+		}
+	}
 	if err := os.Rename(tmp, final); err != nil {
+		if moved != "" {
+			os.RemoveAll(moved)
+		}
 		if _, serr := os.Stat(final); serr == nil {
 			return Release{}, errExists
 		}
@@ -217,9 +363,27 @@ func (s *releaseStore) addWith(version string, maxBytes int64, fill func(tmp str
 	return rel, nil
 }
 
-func (s *releaseStore) remove(version string) error {
-	if _, err := s.binPath(version); err != nil {
+// archive writes tree as a tar.gz, the form a folder version is kept in.
+func (s *releaseStore) archive(tree, dest string) error {
+	f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+	if err != nil {
 		return err
+	}
+	if err := tarGzDir(tree, f); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func (s *releaseStore) remove(version string) error {
+	if !s.exists(version) {
+		return errNotFound
+	}
+	if s.folder {
+		if err := os.RemoveAll(s.treePath(version)); err != nil {
+			return err
+		}
 	}
 	return os.RemoveAll(filepath.Join(s.dir, "releases", version))
 }
