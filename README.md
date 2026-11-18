@@ -41,7 +41,7 @@ flowchart LR
 
 **Contents:** [Quick start](#quick-start) · [Moving an existing command](#moving-an-existing-command-to-drover) ·
 [Updating the binary](#updating-the-binary) ·
-[Folder apps](#folder-apps-php-node-python) · [Commands](#commands) · [Configuration](#configuration) ·
+[Folder apps](#folder-apps-php-node-python) · [Adding apps through the API](#adding-apps-through-the-api) · [Commands](#commands) · [Configuration](#configuration) ·
 [Environment variables](#environment-variables-of-the-app) ·
 [Adding it to an image](#adding-it-to-an-image) · [Logs](#logs) · [Metrics](#metrics) ·
 [WebSockets](#websockets-and-other-long-lived-connections) · [For AI agents](#for-ai-agents) ·
@@ -262,6 +262,50 @@ not start is not activated, every version stays for `activate` and `rollback`.
 - **Size.** `max_binary_bytes` (1 GiB) caps both the archive and what it unpacks to, and a folder may have
   at most 200000 entries. Every version is a full copy: delete old ones with `drover rm`.
 
+## Adding apps through the API
+
+With the switch on, apps can be added and removed while drover runs, without editing the config or
+restarting. It is off by default, because whoever can call the admin API can then run any command and open
+new ports.
+
+```sh
+drover run --manage-apps                       # or admin.manage_apps: true, or DROVER_MANAGE_APPS=1
+                                               # (with no config file, drover starts with no app at all)
+
+drover app add api --listen :8081 --instances 2 --health /health -- '{bin}' --port '{port}'
+drover app add site --listen :8082 --folder /srv/site -- php -S '127.0.0.1:{port}' -t '{dir}/public'
+drover app list
+drover app show api                            # the definition it was added with (env names only)
+drover app rm api                              # stop it, close its port, keep its versions
+drover app rm api --purge                      # ... and delete its versions
+```
+
+```sh
+curl -X POST localhost:9100/apps -d '{"name": "api", "command": "{bin} --port {port}", "listen": ":8081",
+                                      "instances": 2, "health": {"path": "/health", "interval": "2s"}}'
+curl -X DELETE 'localhost:9100/apps/api?purge=true'
+```
+
+- **The same keys as in the config file**, with durations as strings (`"30s"`). Unknown keys are refused.
+- **It starts empty** when there is nothing to run yet, and runs a first `drover upload` or `fetch`.
+- **Ports are checked before anything starts.** Without `port_base`, the first free range from 9000 is
+  picked. A name in use, overlapping instance ports or a taken `listen` port is refused with 409.
+- **Persistent.** The definitions are kept in `<data>/apps.json`, and drover starts those apps again when it
+  restarts, on the version each was running. That only holds if the data directory is on a volume; without
+  one, a container restart loses them, their versions included.
+- **`env` values given here are written to `apps.json`** (mode 0600, readable by drover only). Secrets
+  belong in an `env_file`; the API only ever shows the names.
+- **Apps from the config file cannot be changed or removed through the API.** If the config file later
+  defines an app with the name of an API app, the config wins: the API app is left out with a warning,
+  stays recorded, and can be removed with `drover app rm`.
+- **An API app whose port is taken at boot** is left out with a warning instead of keeping drover from
+  starting. A config app whose port is taken still stops the start.
+- Its status shows `"origin": "api"` (`"config"` for the others).
+- Removing an app waits for nothing: open requests get up to 10 seconds, then the instances stop. A
+  rollout of it that is running makes the removal fail with 409.
+- Changing an existing app (instances, command) is not possible yet: remove it and add it again under the
+  same name, which keeps its versions.
+
 ## Commands
 
 Every operation is an HTTP call on the admin API and a subcommand of the binary, for images without curl.
@@ -270,6 +314,9 @@ The subcommands read `DROVER_ADMIN` (default `http://127.0.0.1:9100`) and `DROVE
 | Goal | Command | HTTP |
 |---|---|---|
 | Status of all apps / one app | `drover status [app]` | `GET /apps`, `GET /apps/<app>` |
+| Add an app (switch on) | `drover app add <name> --listen <addr> [flags] -- <command>` | `POST /apps` |
+| Remove an app added through the API | `drover app rm <name> [--purge]` | `DELETE /apps/<name>[?purge=true]` |
+| Definition of an API app | `drover app show <name>` | `GET /apps/<name>/spec` |
 | List versions | `drover releases <app>` | `GET /apps/<app>/releases` |
 | Add a version from a file, folder or archive | `drover upload <app> <path> --version <v>` | `PUT /apps/<app>/releases/<v>` |
 | Add a version from a URL | `drover fetch <app> --url <url> --version <v>` | `POST /apps/<app>/releases` |
@@ -297,7 +344,8 @@ exit 1. Response codes and JSON shapes are in [`llms.txt`](llms.txt).
 
 `drover run` takes either flags and a command (one app), or `-c drover.yaml`
 ([every key](drover.example.yaml)). Flags, for the one-app form: `--name` `--listen` `--instances`
-`--port-base` `--health` `--env-file` `--folder`. For both forms: `--admin` `--metrics` `--data`.
+`--port-base` `--health` `--env-file` `--folder`. For both forms: `--admin` `--metrics` `--data`
+`--manage-apps`.
 
 | Variable | Read by | Meaning |
 |---|---|---|
@@ -306,6 +354,7 @@ exit 1. Response codes and JSON shapes are in [`llms.txt`](llms.txt).
 | `DROVER_TOKEN` | server, client | Admin API token. On the server it wins over `admin.token`. |
 | `DROVER_DATA` | server | Data directory, when `data:` and `--data` are not set. Default `~/.local/share/drover`. |
 | `DROVER_IMAGE_FETCH_URL` | server | image-file-fetch server for image sources. Wins over `image_fetch_url`. |
+| `DROVER_MANAGE_APPS` | server | `1` or `true`: allow adding and removing apps through the API. |
 | `DROVER_ADMIN` | client | URL of the admin API, default `http://127.0.0.1:9100`. |
 | `PORT`, `DROVER_APP`, `DROVER_INDEX`, `DROVER_VERSION`, `DROVER_DIR` | set for each instance | Its port, app name, instance number, version and, for a folder app, the folder of that version. |
 
@@ -516,6 +565,8 @@ drover llms
   subcommands always send `X-Drover-Token`; a proxy's basic auth can go in the URL:
   `DROVER_ADMIN=https://user:pass@admin.example.com`. With curl:
   `curl -u user:pass -H "X-Drover-Token: $DROVER_TOKEN" https://admin.example.com/apps`.
+- `admin.manage_apps` widens what the admin API can do: from replacing what configured apps run to running
+  any command as a new app and opening new public ports. Keep it off unless you need it.
 - Whoever can call the admin API can set an app's variables and replace its env file, but cannot read
   values back through it. (They could still deploy a binary that prints them: the admin API is full control.)
 - The logs endpoint is part of the admin API, so app output has the same protection. The separate metrics
@@ -532,7 +583,8 @@ drover llms
 - Raw TCP. The load balancer speaks HTTP/1.1 to the instances.
 - Sticky sessions.
 - Building. A folder version is used as it arrives; build it in CI.
-- Changing the number of instances while running. Change the config and restart drover.
+- Changing the number of instances of a running app. For a config app, change the config and restart
+  drover; for an API app, remove it and add it again.
 - Keeping logs. The buffer is for looking at what just happened; history belongs to your log collection.
 - Reaping orphaned processes when it is PID 1. If your app leaves grandchildren behind, run it under an init
   (`docker run --init`).
@@ -560,6 +612,7 @@ a GitHub release.
 | `archive.go`, `git.go` | Folder versions: unpacking archives safely, checking a tree, fetching a commit. |
 | `admin.go` | The admin API. |
 | `env.go` | The app's environment: env file, overrides, and changing them with a rolling restart. |
+| `managed.go` | Apps added and removed through the API, and `apps.json`. |
 | `logs.go`, `metrics.go` | The log buffer and the Prometheus output. |
 | `llms.txt` | The agent reference, embedded in the binary. |
 
@@ -588,6 +641,10 @@ a GitHub release.
   another `Authorization` is tested; `DROVER_ADMIN=https://user:pass@host` was not run against a real proxy.
 - **A mounted, read-only env file.** The "not writable" answer is not tested, nor is an env file that is a
   single bind-mounted file or a Kubernetes secret.
+- **API apps with a volume, in a container.** Keeping them across a restart was tested as a process
+  restart on the same data directory.
+- **Two clients adding apps at the same moment.** Adds and removes are serialized by a lock, but no test
+  runs them concurrently.
 - **`DROVER_ADMIN_LISTEN` in the test suite.** Its order against the flag and the config was checked by
   hand only.
 - **A volume on the data directory in a container.** Keeping the version across a restart of drover is
@@ -608,11 +665,13 @@ a GitHub release.
   versions (tar.gz, zip, a subfolder, a folder that does not start, archives that are refused, a git
   repository at HEAD and at a tag, an image folder, an archive by URL), and URL sources that need a login
   (a header, a bearer token, basic auth, a login in the URL, credentials not following a redirect to
-  another host, nothing kept in the version record or the logs).
+  another host, nothing kept in the version record or the logs), and apps added through the API (the
+  switch, adding, refusals, `apps.json`, coming back after a restart on the same version, removing with
+  and without purge, the config winning over a recorded name).
 - On GitHub: CI and the publish workflow ran for `v0.1.0`; the amd64 release binary and the image were
   downloaded and run.
 - By hand: uploads with `curl -T` and `wget --method=PUT`; `curl` on the logs and metrics endpoints;
-  `drover status`, `releases`, `upload`, `rollback`, `restart`, `logs` and `env`; folder versions
+  `drover status`, `releases`, `upload`, `rollback`, `restart`, `logs`, `env` and `app`; folder versions
   from a local folder, from `nginx:alpine` through a real image-file-fetch server, and from a tag of a
   public GitHub repository; `--admin` and
   `DROVER_ADMIN_LISTEN`; the `examples/inject` image as uid 1000 on a read-only root filesystem with all

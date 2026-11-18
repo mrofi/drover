@@ -47,11 +47,12 @@ func (d *Drover) adminRoutes(e *echo.Echo) {
 	g := e.Group("", d.auth)
 	g.GET("/apps", func(c echo.Context) error {
 		out := []AppStatus{}
-		for _, a := range d.apps {
+		for _, a := range d.appList() {
 			out = append(out, a.status())
 		}
 		return c.JSON(http.StatusOK, out)
 	})
+	d.manageRoutes(g)
 	g.GET("/apps/:app", d.withApp(func(c echo.Context, a *App) error {
 		return c.JSON(http.StatusOK, a.status())
 	}))
@@ -223,10 +224,8 @@ func (d *Drover) auth(next echo.HandlerFunc) echo.HandlerFunc {
 
 func (d *Drover) withApp(h func(echo.Context, *App) error) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		for _, a := range d.apps {
-			if a.cfg.Name == c.Param("app") {
-				return h(c, a)
-			}
+		if a := d.findApp(c.Param("app")); a != nil {
+			return h(c, a)
 		}
 		return echo.NewHTTPError(http.StatusNotFound, "no such app")
 	}

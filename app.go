@@ -8,6 +8,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+
+	"github.com/labstack/echo/v4"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +27,8 @@ type App struct {
 	transport    *http.Transport
 	healthClient *http.Client
 	logs         *logBuffer
+	origin       string     // "config" or "api"
+	server       *echo.Echo // its load balancer, so a removed app can close its port
 	metrics      *appMetrics
 
 	mu        sync.RWMutex
@@ -375,6 +379,8 @@ type AppStatus struct {
 	Version  string `json:"version"`
 	Previous string `json:"previous,omitempty"`
 	Rolling  bool   `json:"rolling"`
+	// Origin is "config" for an app from the config file, "api" for one added through the API.
+	Origin string `json:"origin"`
 	// Folder: versions of this app are folders, not single binaries.
 	Folder bool `json:"folder,omitempty"`
 	// EnvPending: the stored environment differs from what the running instances were started with.
@@ -389,7 +395,7 @@ func (a *App) status() AppStatus {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	st := AppStatus{Name: a.cfg.Name, Listen: a.cfg.Listen, Version: a.version, Previous: a.previous,
-		Rolling: a.rolling.Load(), Folder: a.cfg.folderMode}
+		Rolling: a.rolling.Load(), Folder: a.cfg.folderMode, Origin: a.origin}
 	for k := range a.overrides {
 		st.EnvOverrides = append(st.EnvOverrides, k)
 	}

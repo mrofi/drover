@@ -53,6 +53,7 @@ func (m *appMetrics) observe(code int, took time.Duration) {
 
 // writeMetrics writes every metric in the Prometheus text format.
 func (d *Drover) writeMetrics(w io.Writer) {
+	apps := d.appList()
 	head := func(name, kind, help string) {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, kind)
 	}
@@ -60,7 +61,7 @@ func (d *Drover) writeMetrics(w io.Writer) {
 	fmt.Fprintf(w, "drover_build_info{version=%q} 1\n", version)
 
 	head("drover_requests_total", "counter", "Requests answered by the load balancer, by status code (499: the client went away, 101: upgraded connection).")
-	for _, a := range d.apps {
+	for _, a := range apps {
 		a.metrics.mu.Lock()
 		codes := make([]int, 0, len(a.metrics.codes))
 		for c := range a.metrics.codes {
@@ -74,7 +75,7 @@ func (d *Drover) writeMetrics(w io.Writer) {
 	}
 
 	head("drover_request_duration_seconds", "histogram", "Time from receiving a request to finishing its response.")
-	for _, a := range d.apps {
+	for _, a := range apps {
 		a.metrics.mu.Lock()
 		var cum uint64
 		for i, le := range durationBuckets {
@@ -89,7 +90,7 @@ func (d *Drover) writeMetrics(w io.Writer) {
 
 	counter := func(name, help string, get func(*App) uint64) {
 		head(name, "counter", help)
-		for _, a := range d.apps {
+		for _, a := range apps {
 			fmt.Fprintf(w, "%s{app=%q} %d\n", name, a.cfg.Name, get(a))
 		}
 	}
@@ -99,13 +100,13 @@ func (d *Drover) writeMetrics(w io.Writer) {
 		func(a *App) uint64 { return a.metrics.exits.Load() })
 
 	head("drover_rollouts_total", "counter", "Finished rollouts (version switches and rolling restarts), by result.")
-	for _, a := range d.apps {
+	for _, a := range apps {
 		fmt.Fprintf(w, "drover_rollouts_total{app=%q,result=\"success\"} %d\n", a.cfg.Name, a.metrics.rolloutsOK.Load())
 		fmt.Fprintf(w, "drover_rollouts_total{app=%q,result=\"failed\"} %d\n", a.cfg.Name, a.metrics.rolloutsFail.Load())
 	}
 
-	statuses := make([]AppStatus, len(d.apps))
-	for i, a := range d.apps {
+	statuses := make([]AppStatus, len(apps))
+	for i, a := range apps {
 		statuses[i] = a.status()
 	}
 	gauge := func(name, help string, get func(AppStatus) int) {

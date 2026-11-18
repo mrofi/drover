@@ -37,6 +37,8 @@ func runClient(cmd string, args []string) error {
 		return call(http.MethodGet, "/apps/"+app, nil, "")
 	case "env":
 		return runEnv(args)
+	case "app":
+		return runApp(args)
 	case "logs":
 		if err := need(1, "<app> [-f] [--tail n] [--instance n]"); err != nil {
 			return err
@@ -152,6 +154,69 @@ func runClient(cmd string, args []string) error {
 		return call(http.MethodPut, "/apps/"+app+"/releases/"+url.PathEscape(*ver)+"?"+q.Encode(), f, "application/octet-stream")
 	}
 	return fmt.Errorf("unknown command %q (try `drover help`)", cmd)
+}
+
+// runApp implements `drover app add|rm|show|list`.
+func runApp(args []string) error {
+	usage := errors.New("usage: drover app add <name> --listen <addr> [flags] -- <command> | app rm <name> [--purge] | app show <name> | app list")
+	if len(args) == 0 {
+		return usage
+	}
+	switch args[0] {
+	case "list", "ls":
+		return call(http.MethodGet, "/apps", nil, "")
+	case "show":
+		if len(args) != 2 {
+			return usage
+		}
+		return call(http.MethodGet, "/apps/"+url.PathEscape(args[1])+"/spec", nil, "")
+	case "rm", "remove":
+		if len(args) < 2 || strings.HasPrefix(args[1], "-") {
+			return usage
+		}
+		fs := flag.NewFlagSet("app rm", flag.ContinueOnError)
+		purge := fs.Bool("purge", false, "also delete the app's versions")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		q := ""
+		if *purge {
+			q = "?purge=true"
+		}
+		return call(http.MethodDelete, "/apps/"+url.PathEscape(args[1])+q, nil, "")
+	case "add":
+		if len(args) < 2 || strings.HasPrefix(args[1], "-") {
+			return usage
+		}
+		spec := appSpec{Name: args[1], Env: map[string]string{}}
+		fs := flag.NewFlagSet("app add", flag.ContinueOnError)
+		fs.StringVar(&spec.Listen, "listen", "", "public address, e.g. :8081")
+		fs.IntVar(&spec.Instances, "instances", 2, "number of instances")
+		fs.IntVar(&spec.PortBase, "port-base", 0, "first instance port (default: the first free range from 9000)")
+		fs.StringVar(&spec.Health.Path, "health", "", "health check path")
+		fs.StringVar(&spec.Folder, "folder", "", "built-in folder of a folder app ({dir} in the command)")
+		fs.StringVar(&spec.Binary, "binary", "", "the file releases replace, when it is not the first word")
+		fs.StringVar(&spec.EnvFile, "env-file", "", "KEY=VALUE file read at every instance start")
+		fs.StringVar(&spec.Dir, "dir", "", "working directory")
+		fs.Func("env", "KEY=VALUE for the app's environment, stored in apps.json (repeatable; secrets belong in --env-file)", func(kv string) error {
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok {
+				return fmt.Errorf("%q is not KEY=VALUE", kv)
+			}
+			spec.Env[k] = v
+			return nil
+		})
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		if fs.NArg() == 0 {
+			return errors.New("give the command after --: drover app add <name> --listen :8081 -- <command>")
+		}
+		spec.Command = fs.Args()
+		body, _ := json.Marshal(spec)
+		return call(http.MethodPost, "/apps", bytes.NewReader(body), "application/json")
+	}
+	return usage
 }
 
 // runEnv implements `drover env ...`. Flags may come anywhere after the subcommand.

@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 )
 
@@ -24,10 +25,14 @@ const usage = `drover: run a command as supervised instances behind one load-bal
 
 Server:
   drover run -c drover.yaml
+  drover run --manage-apps                       no app yet: add them with "drover app add"
   drover run [--name app] [--listen :8080] [--instances 2] [--health /health] [--env-file f] -- <command> [args, {port}]
 
 Client (talks to a running drover; DROVER_ADMIN, default http://127.0.0.1:9100, and DROVER_TOKEN):
   drover status [app]
+  drover app add <name> --listen :8081 [--instances n] [--health /h] [--folder d] [--env K=V]... -- <command>
+  drover app rm <name> [--purge]                     --purge also deletes its versions
+  drover app show <name>                             the definition it was added with (env names only)
   drover releases <app>
   drover env <app>                                   names of the variables, by source
   drover env set <app> KEY=VALUE... [--file] [--no-restart]
@@ -90,6 +95,7 @@ func runServer(args []string) error {
 	health := fs.String("health", "", "health check path; empty checks that the port accepts connections (without -c)")
 	admin := fs.String("admin", os.Getenv("DROVER_ADMIN_LISTEN"), "admin API address (default 127.0.0.1:9100; also DROVER_ADMIN_LISTEN)")
 	data := fs.String("data", "", "where releases are kept")
+	manage := fs.Bool("manage-apps", false, "allow adding and removing apps through the API (also DROVER_MANAGE_APPS=1)")
 	metrics := fs.String("metrics", "", "extra address that serves only /metrics, without a token (e.g. :9101)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -109,8 +115,13 @@ func runServer(args []string) error {
 				}
 			}
 		}
+		manageEnv := os.Getenv("DROVER_MANAGE_APPS")
+		if *path == "" && (*manage || manageEnv == "1" || strings.EqualFold(manageEnv, "true")) {
+			cfg = &Config{} // no app yet: they are added through the API
+			break
+		}
 		if *path == "" {
-			return fmt.Errorf("no config: use -c drover.yaml, or `drover run -- <command>`")
+			return fmt.Errorf("no config: use -c drover.yaml, `drover run -- <command>`, or --manage-apps to add apps through the API")
 		}
 		var err error
 		if cfg, err = loadConfig(*path); err != nil {
@@ -122,6 +133,9 @@ func runServer(args []string) error {
 	}
 	if *metrics != "" {
 		cfg.Metrics.Listen = *metrics
+	}
+	if *manage {
+		cfg.Admin.ManageApps = true
 	}
 	if *data != "" {
 		cfg.Data = *data

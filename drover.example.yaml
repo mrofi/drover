@@ -7,6 +7,10 @@ data: /home/app/.local/share/drover
 admin:
   # Also the --admin flag, or DROVER_ADMIN_LISTEN; both win over this file.
   listen: 127.0.0.1:9100
+  # Allow adding and removing apps through the API (drover app add/rm). They are kept in <data>/apps.json.
+  # Off by default: whoever can call the API could then run any command. Also --manage-apps and
+  # DROVER_MANAGE_APPS=1.
+  manage_apps: false
   # Required when listen is not loopback: the admin API can replace the binaries drover runs.
   # Also DROVER_TOKEN (which wins).
   token: ""

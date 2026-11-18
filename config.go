@@ -39,6 +39,8 @@ type MetricsConfig struct {
 type AdminConfig struct {
 	Listen string `yaml:"listen"`
 	Token  string `yaml:"token"`
+	// ManageApps lets the API add and remove apps. Off by default: an app's command can be anything.
+	ManageApps bool `yaml:"manage_apps"`
 }
 
 type AppConfig struct {
@@ -195,8 +197,11 @@ func (c *Config) normalize() error {
 	if c.MaxBinaryBytes <= 0 {
 		c.MaxBinaryBytes = 1 << 30
 	}
-	if len(c.Apps) == 0 {
-		return errors.New("no apps configured")
+	if v := os.Getenv("DROVER_MANAGE_APPS"); v == "1" || strings.EqualFold(v, "true") {
+		c.Admin.ManageApps = true
+	}
+	if len(c.Apps) == 0 && !c.Admin.ManageApps {
+		return errors.New("no apps configured (or turn on admin.manage_apps to add them through the API)")
 	}
 	seen := map[string]bool{}
 	for i, a := range c.Apps {
@@ -213,7 +218,7 @@ func (c *Config) normalize() error {
 	}
 	for i, a := range c.Apps {
 		for _, b := range c.Apps[i+1:] {
-			if a.PortBase < b.PortBase+2*b.Instances && b.PortBase < a.PortBase+2*a.Instances {
+			if overlaps(a, b) {
 				return fmt.Errorf("apps %q and %q have overlapping instance ports (set port_base)", a.Name, b.Name)
 			}
 		}

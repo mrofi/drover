@@ -116,6 +116,29 @@ apps:
     env_file: ""                      # KEY=VALUE file read at each instance start; wins over env
 ```
 
+## Apps added through the API
+
+Only when the server runs with `admin.manage_apps: true`, `--manage-apps` or `DROVER_MANAGE_APPS=1`
+(otherwise 403). With it and no config file, drover may start with no app.
+
+| Goal | CLI | HTTP |
+|---|---|---|
+| Add | `drover app add <name> --listen <addr> [--instances n] [--port-base p] [--health /h] [--folder d] [--binary f] [--env-file f] [--env K=V]... -- <command>` | `POST /apps` with the config keys as JSON: `{"name","command"(string or list),"listen","instances","port_base","health":{"path","interval","timeout"},"folder","binary","env_file","env":{},"dir","start_timeout","drain_timeout","stop_timeout","try_duration","stop_signal"}`; durations as strings |
+| Remove | `drover app rm <name> [--purge]` | `DELETE /apps/<name>[?purge=true]` |
+| Show its definition | `drover app show <name>` | `GET /apps/<name>/spec` (env names only) |
+| List | `drover app list` | `GET /apps` |
+
+- 201 with the app status on add; it starts with nothing to run until a first upload/fetch, unless its
+  first word (or `folder:`) already exists. 400: unknown key, bad name or duration, reserved env name,
+  invalid app. 409: name in use (also by a recorded but not running app), instance ports overlap another
+  app, `listen` taken. 204 on remove; 404 unknown; 409 for a config app or while a rollout of it runs.
+- Without `port_base` the first free range from 9000 is taken and recorded.
+- Recorded in `<data>/apps.json` (0600, includes `env` values) and started again when drover restarts, on
+  the version it was on. Lost with the data directory when that is not on a volume.
+- Status has `"origin": "api"` or `"config"`. Config apps cannot be changed or removed through the API; a
+  config app with the same name as a recorded API app wins, and the API app is skipped with a warning.
+- To change an API app's instances or command: `drover app rm <name>`, then add it again; versions stay.
+
 ## Control a running drover
 
 Client commands talk to the admin API at `DROVER_ADMIN` (a URL, default `http://127.0.0.1:9100`; set it
@@ -279,7 +302,8 @@ Read-only root filesystem: set `DROVER_DATA` to a writable mount that allows exe
 - No build step: folder versions are used as they arrive.
 - WebSockets work. A rollout closes connections still open on an old instance after `drain_timeout`;
   clients must reconnect.
-- The instance count cannot change while running: change the config and restart drover.
+- The instance count of a running app cannot change: change the config and restart drover, or for an API
+  app remove and add it again.
 - Version names are fixed; there are no movable aliases such as `stable`.
 - The admin API can replace running binaries. Keep it on loopback or behind a token.
 - Rolling back a version does not roll back variables.

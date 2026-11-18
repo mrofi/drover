@@ -1251,3 +1251,196 @@ func TestURLSourceThatNeedsAuthorization(t *testing.T) {
 		}
 	}
 }
+
+// --- apps added through the API
+
+func (h *harness) addApp(spec map[string]any) (int, string) {
+	b, _ := json.Marshal(spec)
+	return h.do(http.MethodPost, "/apps", bytes.NewReader(b))
+}
+
+// appStatus returns the status of any app, by name.
+func (h *harness) appStatus(name string) (AppStatus, int) {
+	h.t.Helper()
+	code, body := h.do(http.MethodGet, "/apps/"+name, nil)
+	var st AppStatus
+	if code == 200 {
+		json.Unmarshal([]byte(body), &st)
+	}
+	return st, code
+}
+
+func getVia(addr, path string) (int, string) {
+	resp, err := http.Get("http://" + addr + path)
+	if err != nil {
+		return 0, err.Error()
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(raw)
+}
+
+func TestAppsThroughTheAPI(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "api-app")
+	raw, _ := os.ReadFile(binV1)
+	os.WriteFile(bin, raw, 0o755)
+	h := startDrover(t, func(c *Config) { c.Admin.ManageApps = true })
+	spec := map[string]any{"name": "api", "command": []string{bin, "--port", "{port}"}, "listen": "127.0.0.1:0",
+		"instances": 2, "health": map[string]any{"path": "/health", "interval": "100ms"},
+		"env": map[string]string{"GREETING": "hi", "API_KEY": "s3cret"}}
+	code, body := h.addApp(spec)
+	if code != 201 || !strings.Contains(body, `"origin":"api"`) {
+		t.Fatalf("add: %d %s", code, body)
+	}
+	var st AppStatus
+	json.Unmarshal([]byte(body), &st)
+	h.waitFor("the new app's instances", func() bool {
+		st, _ = h.appStatus("api")
+		return len(st.Instances) == 2 && st.Instances[0].State == "healthy" && st.Instances[1].State == "healthy"
+	})
+	if code, body := getVia(st.Listen, "/env?name=GREETING"); code != 200 || strings.TrimSpace(body) != "hi" {
+		t.Fatalf("the new app does not answer on its port: %d %s", code, body)
+	}
+	// It got the first free instance range after the config app's (which starts at its own port_base).
+	web, _ := h.appStatus("web")
+	if st.Instances[0].Port < web.Instances[0].Port+4 && st.Instances[0].Port >= web.Instances[0].Port {
+		t.Fatalf("the new app's ports %d overlap the config app's %d", st.Instances[0].Port, web.Instances[0].Port)
+	}
+	// The definition is recorded, readable only by drover; the API shows env names, never values.
+	info, err := os.Stat(filepath.Join(h.d.cfg.Data, "apps.json"))
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("apps.json: %v %v", info, err)
+	}
+	if _, body := h.do(http.MethodGet, "/apps/api/spec", nil); strings.Contains(body, "s3cret") || !strings.Contains(body, `"API_KEY"`) || !strings.Contains(body, `"port_base"`) {
+		t.Fatalf("spec: %s", body)
+	}
+	// Versions work the same as for any app.
+	f, _ := os.Open(binV2)
+	defer f.Close()
+	if code, body := h.do(http.MethodPut, "/apps/api/releases/v2", f); code != 200 {
+		t.Fatalf("upload to the new app: %d %s", code, body)
+	}
+
+	// Refused: a name in use, overlapping ports, a taken port, typos, a bad duration, removing a config app.
+	for name, tc := range map[string]struct {
+		spec map[string]any
+		code int
+	}{
+		"name in use":   {map[string]any{"name": "web", "command": bin, "listen": "127.0.0.1:0"}, 409},
+		"ports overlap": {map[string]any{"name": "x1", "command": bin, "listen": "127.0.0.1:0", "port_base": st.Instances[0].Port}, 409},
+		"listen taken":  {map[string]any{"name": "x2", "command": bin, "listen": st.Listen}, 409},
+		"unknown key":   {map[string]any{"name": "x3", "command": bin, "listen": "127.0.0.1:0", "instancez": 2}, 400},
+		"bad duration":  {map[string]any{"name": "x4", "command": bin, "listen": "127.0.0.1:0", "stop_timeout": "soon"}, 400},
+		"no command":    {map[string]any{"name": "x5", "listen": "127.0.0.1:0"}, 400},
+		"bad name":      {map[string]any{"name": "../x", "command": bin, "listen": "127.0.0.1:0"}, 400},
+		"reserved env":  {map[string]any{"name": "x6", "command": bin, "listen": "127.0.0.1:0", "env": map[string]string{"PORT": "1"}}, 400},
+	} {
+		if code, body := h.addApp(tc.spec); code != tc.code {
+			t.Errorf("%s: want %d, got %d %s", name, tc.code, code, body)
+		}
+	}
+	if code, body := h.do(http.MethodDelete, "/apps/web", nil); code != 409 || !strings.Contains(body, "config file") {
+		t.Fatalf("removing a config app: %d %s", code, body)
+	}
+	if _, err := os.Stat(filepath.Join(h.d.cfg.Data, "x2")); err == nil {
+		t.Fatal("a refused app left its data directory behind")
+	}
+
+	// Restart drover: the app comes back on the version it was running.
+	h.d.stop()
+	cfg := h.d.cfg
+	d, err := newDrover(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.start(); err != nil {
+		t.Fatal(err)
+	}
+	defer d.stop()
+	h2 := &harness{t: t, d: d, app: "http://" + d.apps[0].addr.String(), admin: "http://" + d.adminAddr.String()}
+	h2.waitFor("the API app after a restart", func() bool {
+		st, code := h2.appStatus("api")
+		if code != 200 || st.Version != "v2" || len(st.Instances) == 0 || st.Instances[0].State != "healthy" {
+			return false
+		}
+		code, body := getVia(st.Listen, "/")
+		return code == 200 && strings.HasPrefix(body, "v2 ")
+	})
+
+	// Remove it: the port closes, the processes stop, the versions stay unless purged.
+	st, _ = h2.appStatus("api")
+	pids := []int64{st.Instances[0].PID, st.Instances[1].PID}
+	if code, body := h2.do(http.MethodDelete, "/apps/api", nil); code != 204 {
+		t.Fatalf("remove: %d %s", code, body)
+	}
+	if _, code := h2.appStatus("api"); code != 404 {
+		t.Fatalf("after removal: %d", code)
+	}
+	if code, _ := getVia(st.Listen, "/"); code != 0 {
+		t.Fatalf("the removed app's port still answers: %d", code)
+	}
+	for _, pid := range pids {
+		if syscall.Kill(int(pid), 0) == nil {
+			t.Fatalf("instance %d of the removed app is still running", pid)
+		}
+	}
+	releases := filepath.Join(cfg.Data, "api", "releases", "v2")
+	if _, err := os.Stat(releases); err != nil {
+		t.Fatal("removing without purge deleted the versions")
+	}
+	if raw, _ := os.ReadFile(filepath.Join(cfg.Data, "apps.json")); strings.Contains(string(raw), `"api"`) {
+		t.Fatalf("apps.json still has the removed app: %s", raw)
+	}
+	// Added again under the same name it finds its versions; removed with purge they are gone.
+	spec["listen"] = "127.0.0.1:0"
+	if code, body := h2.addApp(spec); code != 201 || !strings.Contains(body, `"version":"v2"`) {
+		t.Fatalf("re-add: %d %s", code, body)
+	}
+	if code, _ := h2.do(http.MethodDelete, "/apps/api?purge=true", nil); code != 204 {
+		t.Fatalf("remove with purge: %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Data, "api")); err == nil {
+		t.Fatal("purge left the app's data behind")
+	}
+	if code, _ := h2.do(http.MethodDelete, "/apps/api", nil); code != 404 {
+		t.Fatalf("removing twice: want 404, got %d", code)
+	}
+}
+
+func TestAppsThroughTheAPIOffByDefaultAndConfigWins(t *testing.T) {
+	h := startDrover(t, nil)
+	if code, body := h.addApp(map[string]any{"name": "x", "command": "/bin/true", "listen": "127.0.0.1:0"}); code != 403 || !strings.Contains(body, "manage_apps") {
+		t.Fatalf("add with the switch off: %d %s", code, body)
+	}
+	if code, _ := h.do(http.MethodDelete, "/apps/web", nil); code != 403 {
+		t.Fatalf("remove with the switch off: %d", code)
+	}
+	// An apps.json entry named like a config app is not started, and stays recorded.
+	h.d.stop()
+	recorded := `{"apps":[{"name":"web","command":"/bin/false","listen":"127.0.0.1:0","port_base":30000}]}`
+	os.WriteFile(filepath.Join(h.d.cfg.Data, "apps.json"), []byte(recorded), 0o600)
+	h.d.cfg.Admin.ManageApps = true
+	d, err := newDrover(h.d.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.start(); err != nil {
+		t.Fatal(err)
+	}
+	defer d.stop()
+	if n := len(d.appList()); n != 1 || d.appList()[0].origin != originConfig {
+		t.Fatalf("want only the config app, got %d apps", n)
+	}
+	h2 := &harness{t: t, d: d, admin: "http://" + d.adminAddr.String()}
+	if code, body := h2.addApp(map[string]any{"name": "web", "command": "/bin/true", "listen": "127.0.0.1:0"}); code != 409 {
+		t.Fatalf("adding over a recorded name: %d %s", code, body)
+	}
+
+	// With no config apps at all, drover starts empty when the switch is on, and not when it is off.
+	if err := (&Config{Data: t.TempDir()}).normalize(); err == nil {
+		t.Fatal("no apps and the switch off should not start")
+	}
+	if err := (&Config{Data: t.TempDir(), Admin: AdminConfig{ManageApps: true}}).normalize(); err != nil {
+		t.Fatalf("no apps with the switch on: %v", err)
+	}
+}
