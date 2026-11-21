@@ -93,6 +93,7 @@ func runServer(args []string) error {
 	folder := fs.String("folder", "", "run from this folder, which versions replace as a whole: {dir} in the command (without -c)")
 	envFile := fs.String("env-file", "", "KEY=VALUE file read at every instance start (without -c)")
 	health := fs.String("health", "", "health check path; empty checks that the port accepts connections (without -c)")
+	ready := fs.String("ready", "", "readiness path an instance must pass before it gets traffic (without -c)")
 	admin := fs.String("admin", os.Getenv("DROVER_ADMIN_LISTEN"), "admin API address (default 127.0.0.1:9100; also DROVER_ADMIN_LISTEN)")
 	data := fs.String("data", "", "where releases are kept (also DROVER_DATA)")
 	cache := fs.String("cache", "", "where folder versions are unpacked (also DROVER_CACHE; default ~/.cache/drover)")
@@ -106,7 +107,7 @@ func runServer(args []string) error {
 	case fs.NArg() > 0:
 		// drover run [flags] -- command args...
 		cfg = &Config{Apps: []*AppConfig{{Name: *name, Command: fs.Args(), Listen: *listen,
-			Instances: *instances, PortBase: *portBase, Health: HealthConfig{Path: *health}, EnvFile: *envFile, Folder: *folder}}}
+			Instances: *instances, PortBase: *portBase, Health: HealthConfig{Path: *health}, Ready: ReadyConfig{Path: *ready}, EnvFile: *envFile, Folder: *folder}}}
 	default:
 		if *path == "" {
 			for _, p := range []string{"drover.yaml", "/etc/drover.yaml"} {

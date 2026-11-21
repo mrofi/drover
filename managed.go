@@ -42,6 +42,7 @@ type appSpec struct {
 	Instances    int               `json:"instances,omitempty"`
 	PortBase     int               `json:"port_base,omitempty"`
 	Health       healthSpec        `json:"health,omitempty"`
+	Ready        healthSpec        `json:"ready,omitempty"`
 	StartTimeout string            `json:"start_timeout,omitempty"`
 	DrainTimeout string            `json:"drain_timeout,omitempty"`
 	StopTimeout  string            `json:"stop_timeout,omitempty"`
@@ -81,7 +82,7 @@ func (c *Command) UnmarshalJSON(b []byte) error {
 func (s appSpec) toConfig() (*AppConfig, error) {
 	cfg := &AppConfig{Name: s.Name, Command: append(Command(nil), s.Command...), Binary: s.Binary,
 		Folder: s.Folder, Listen: s.Listen, Instances: s.Instances, PortBase: s.PortBase,
-		Health: HealthConfig{Path: s.Health.Path}, StopSignal: s.StopSignal, Dir: s.Dir, EnvFile: s.EnvFile}
+		Health: HealthConfig{Path: s.Health.Path}, Ready: ReadyConfig{Path: s.Ready.Path}, StopSignal: s.StopSignal, Dir: s.Dir, EnvFile: s.EnvFile}
 	if len(s.Env) > 0 {
 		cfg.Env = map[string]string{}
 		for k, v := range s.Env {
@@ -98,6 +99,8 @@ func (s appSpec) toConfig() (*AppConfig, error) {
 	}{
 		{"health.interval", s.Health.Interval, &cfg.Health.Interval},
 		{"health.timeout", s.Health.Timeout, &cfg.Health.Timeout},
+		{"ready.interval", s.Ready.Interval, &cfg.Ready.Interval},
+		{"ready.timeout", s.Ready.Timeout, &cfg.Ready.Timeout},
 		{"start_timeout", s.StartTimeout, &cfg.StartTimeout},
 		{"drain_timeout", s.DrainTimeout, &cfg.DrainTimeout},
 		{"stop_timeout", s.StopTimeout, &cfg.StopTimeout},

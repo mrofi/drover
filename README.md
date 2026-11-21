@@ -138,6 +138,27 @@ Things that go wrong:
 - **No health path.** Without `--health /path` an instance counts as healthy as soon as its port accepts
   connections, which may be before the app is ready.
 
+### Health and readiness
+
+One check, `health.path`, is enough for most apps. When the app has a deep readiness endpoint (it checks the
+database, a cache, S3) or warms up slowly, add a `ready` check (`--ready /readyz`) as well:
+
+- **Before traffic:** a started or restarted instance gets traffic only once `ready.path` answers 2xx or 3xx.
+  Its state is `starting` until then.
+- **During a rollout:** the switch waits for `ready.path`, so a version that cannot reach its database is
+  called off (`not ready after ...`) and the old one keeps serving.
+- **After that:** only `health.path` keeps an instance in the pool. A short outage of the database does not
+  take every live instance out at once.
+
+```yaml
+health:
+  path: /healthz       # the process answers
+ready:
+  path: /readyz        # and can reach what it needs
+  interval: 250ms      # how often a not yet ready instance is asked (default)
+  timeout: 2s          # default: health.timeout
+```
+
 ## Updating the binary
 
 The first word of the command is the binary that a release replaces (or put `{bin}` where it belongs, as in
@@ -344,7 +365,7 @@ exit 1. Response codes and JSON shapes are in [`llms.txt`](llms.txt).
 
 `drover run` takes either flags and a command (one app), or `-c drover.yaml`
 ([every key](drover.example.yaml)). Flags, for the one-app form: `--name` `--listen` `--instances`
-`--port-base` `--health` `--env-file` `--folder`. For both forms: `--admin` `--metrics` `--data`
+`--port-base` `--health` `--ready` `--env-file` `--folder`. For both forms: `--admin` `--metrics` `--data`
 `--cache` `--manage-apps`.
 
 | Variable | Read by | Meaning |

@@ -194,6 +194,7 @@ func runApp(args []string) error {
 		fs.IntVar(&spec.Instances, "instances", 2, "number of instances")
 		fs.IntVar(&spec.PortBase, "port-base", 0, "first instance port (default: the first free range from 9000)")
 		fs.StringVar(&spec.Health.Path, "health", "", "health check path")
+		fs.StringVar(&spec.Ready.Path, "ready", "", "readiness path an instance must pass before it gets traffic")
 		fs.StringVar(&spec.Folder, "folder", "", "built-in folder of a folder app ({dir} in the command)")
 		fs.StringVar(&spec.Binary, "binary", "", "the file releases replace, when it is not the first word")
 		fs.StringVar(&spec.EnvFile, "env-file", "", "KEY=VALUE file read at every instance start")

@@ -41,6 +41,16 @@ func main() {
 		fmt.Fprintf(w, "%s %s %d\n", version, *port, os.Getpid())
 	})
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
+	// /ready fails while the file named by FAKEAPP_NOT_READY exists: a dependency that is down.
+	http.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		if f := os.Getenv("FAKEAPP_NOT_READY"); f != "" {
+			if _, err := os.Stat(f); err == nil {
+				http.Error(w, "not ready", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		fmt.Fprintln(w, "ready")
+	})
 	http.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(300 * time.Millisecond)
 		fmt.Fprintf(w, "%s slow\n", version)

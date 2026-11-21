@@ -34,6 +34,7 @@ type proc struct {
 	release string // the folder of its version, for a folder app
 
 	healthy  atomic.Bool
+	readyAt  atomic.Int64 // the start (started) at which the instance passed ready.path
 	draining atomic.Bool
 	inflight atomic.Int64
 	exits    atomic.Int64
@@ -175,9 +176,26 @@ func (p *proc) shutdown() {
 }
 
 // healthLoop keeps p.healthy current. It checks more often while the instance is not healthy.
+//
+// With ready.path, a process that started counts as healthy only once it passed that path; from then on
+// health.path alone decides. Readiness belongs to one start of the process: a restarted one has to pass again.
 func (p *proc) healthLoop() {
 	for {
-		ok := p.check()
+		var ok bool
+		wait := p.app.cfg.Health.Interval
+		if ready := p.app.cfg.Ready; ready.Path != "" && !p.isReady() {
+			wait = ready.Interval
+			started := p.started.Load()
+			if ok = p.check(ready.Path, ready.Timeout); ok {
+				p.readyAt.Store(started) // a stale start never equals the current one, so this cannot leak over a restart
+				ok = p.isReady()
+			}
+		} else {
+			ok = p.check(p.app.cfg.Health.Path, p.app.cfg.Health.Timeout)
+			if !ok && wait > 250*time.Millisecond {
+				wait = 250 * time.Millisecond
+			}
+		}
 		select {
 		case <-p.stop:
 			p.healthy.Store(false)
@@ -185,9 +203,8 @@ func (p *proc) healthLoop() {
 		default:
 		}
 		p.healthy.Store(ok)
-		wait := p.app.cfg.Health.Interval
-		if !ok && wait > 250*time.Millisecond {
-			wait = 250 * time.Millisecond
+		if ok && wait < p.app.cfg.Health.Interval {
+			wait = p.app.cfg.Health.Interval // just became ready: from now on the health check's pace
 		}
 		select {
 		case <-p.stop:
@@ -198,23 +215,32 @@ func (p *proc) healthLoop() {
 	}
 }
 
-func (p *proc) check() bool {
+// isReady reports whether the running process passed ready.path (always true without one).
+func (p *proc) isReady() bool {
+	if p.app.cfg.Ready.Path == "" {
+		return true
+	}
+	s := p.started.Load()
+	return s != 0 && p.readyAt.Load() == s
+}
+
+// check asks the instance for path (GET, 2xx/3xx); an empty path only checks that the port takes a connection.
+func (p *proc) check(path string, timeout time.Duration) bool {
 	if p.pid.Load() == 0 {
 		return false
 	}
-	cfg := p.app.cfg.Health
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(p.port))
-	if cfg.Path == "" {
-		conn, err := net.DialTimeout("tcp", addr, cfg.Timeout)
+	if path == "" {
+		conn, err := net.DialTimeout("tcp", addr, timeout)
 		if err != nil {
 			return false
 		}
 		conn.Close()
 		return true
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+cfg.Path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+path, nil)
 	if err != nil {
 		return false
 	}
@@ -238,6 +264,9 @@ func (p *proc) waitHealthy(timeout time.Duration) error {
 			return errors.New("the process keeps exiting right after start")
 		}
 		if time.Now().After(deadline) {
+			if !p.isReady() {
+				return fmt.Errorf("not ready after %s (%s did not answer 2xx or 3xx)", timeout, p.app.cfg.Ready.Path)
+			}
 			return fmt.Errorf("not healthy after %s", timeout)
 		}
 		select {
@@ -254,6 +283,8 @@ func (p *proc) state() string {
 		return "draining"
 	case p.healthy.Load():
 		return "healthy"
+	case p.pid.Load() != 0 && !p.isReady():
+		return "starting"
 	case p.pid.Load() == 0:
 		return "down"
 	default:

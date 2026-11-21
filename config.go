@@ -62,6 +62,7 @@ type AppConfig struct {
 	// PortBase is the first loopback port given to instances. An app uses PortBase .. PortBase+2*Instances-1.
 	PortBase     int               `yaml:"port_base"`
 	Health       HealthConfig      `yaml:"health"`
+	Ready        ReadyConfig       `yaml:"ready"`
 	StartTimeout time.Duration     `yaml:"start_timeout"`
 	DrainTimeout time.Duration     `yaml:"drain_timeout"`
 	StopTimeout  time.Duration     `yaml:"stop_timeout"`
@@ -81,6 +82,18 @@ type HealthConfig struct {
 	Path     string        `yaml:"path"`
 	Interval time.Duration `yaml:"interval"`
 	Timeout  time.Duration `yaml:"timeout"`
+}
+
+// ReadyConfig is an optional readiness check. With a path, an instance gets traffic only once that path answers
+// (GET, 2xx or 3xx): after a start, a restart, and in a rollout before the switch. Once it passed, only the health
+// check keeps the instance in the pool, so this one can check the app's dependencies without an outage of them
+// taking every live instance out at once.
+type ReadyConfig struct {
+	Path string `yaml:"path"`
+	// Interval is how often a not yet ready instance is asked. Default 250ms.
+	Interval time.Duration `yaml:"interval"`
+	// Timeout of one request. Default: the health check's timeout.
+	Timeout time.Duration `yaml:"timeout"`
 }
 
 // Command accepts either a YAML list (used as is) or a string (split like a shell would, without running one).
@@ -304,8 +317,12 @@ func (a *AppConfig) normalize(index int) error {
 	setDefault(&a.DrainTimeout, 30*time.Second)
 	setDefault(&a.StopTimeout, 10*time.Second)
 	setDefault(&a.TryDuration, 5*time.Second)
-	if a.Health.Path != "" && !strings.HasPrefix(a.Health.Path, "/") {
-		a.Health.Path = "/" + a.Health.Path
+	setDefault(&a.Ready.Interval, 250*time.Millisecond)
+	setDefault(&a.Ready.Timeout, a.Health.Timeout)
+	for _, p := range []*string{&a.Health.Path, &a.Ready.Path} {
+		if *p != "" && !strings.HasPrefix(*p, "/") {
+			*p = "/" + *p
+		}
 	}
 	name := strings.TrimPrefix(strings.ToUpper(a.StopSignal), "SIG")
 	if name == "" {

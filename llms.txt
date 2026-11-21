@@ -29,7 +29,7 @@ drover run -c drover.yaml
 ```
 
 Flags for `drover run` without `-c`: `--name app` `--listen :8080` `--instances 2` `--port-base 9000`
-`--health ""` `--env-file ""` `--folder ""`. With or without `-c`: `--admin 127.0.0.1:9100` `--data <dir>` `--metrics <addr>`. Config path may also come from
+`--health ""` `--ready ""` `--env-file ""` `--folder ""`. With or without `-c`: `--admin 127.0.0.1:9100` `--data <dir>` `--metrics <addr>`. Config path may also come from
 `DROVER_CONFIG`, else `./drover.yaml`, else `/etc/drover.yaml`. The admin address may also come from
 `DROVER_ADMIN_LISTEN` (order: `--admin`, then the variable, then the config file).
 
@@ -109,7 +109,11 @@ apps:
       path: ""                        # GET, 2xx/3xx = healthy. Empty = TCP connect to the port.
       interval: 2s
       timeout: 2s
-    start_timeout: 30s                # a new instance must be healthy within this or the rollout is undone
+    ready:                            # optional. A started/restarted instance gets traffic and a rollout
+      path: ""                        # switches only after GET path answers 2xx/3xx; then only `health` counts
+      interval: 250ms                 # how often a not yet ready instance is asked
+      timeout: 2s                     # default: health.timeout
+    start_timeout: 30s                # a new instance must be healthy (and ready) within this or the rollout is undone
     drain_timeout: 30s                # how long an old instance may finish open requests / WebSockets
     stop_timeout: 10s                 # after stop_signal, time until SIGKILL
     stop_signal: TERM                 # TERM INT QUIT HUP KILL USR1 USR2
@@ -126,7 +130,7 @@ Only when the server runs with `admin.manage_apps: true`, `--manage-apps` or `DR
 
 | Goal | CLI | HTTP |
 |---|---|---|
-| Add | `drover app add <name> --listen <addr> [--instances n] [--port-base p] [--health /h] [--folder d] [--binary f] [--env-file f] [--env K=V]... -- <command>` | `POST /apps` with the config keys as JSON: `{"name","command"(string or list),"listen","instances","port_base","health":{"path","interval","timeout"},"folder","binary","env_file","env":{},"dir","start_timeout","drain_timeout","stop_timeout","try_duration","stop_signal"}`; durations as strings |
+| Add | `drover app add <name> --listen <addr> [--instances n] [--port-base p] [--health /h] [--ready /r] [--folder d] [--binary f] [--env-file f] [--env K=V]... -- <command>` | `POST /apps` with the config keys as JSON: `{"name","command"(string or list),"listen","instances","port_base","health":{"path","interval","timeout"},"ready":{"path","interval","timeout"},"folder","binary","env_file","env":{},"dir","start_timeout","drain_timeout","stop_timeout","try_duration","stop_signal"}`; durations as strings |
 | Remove | `drover app rm <name> [--purge]` | `DELETE /apps/<name>[?purge=true]` |
 | Show its definition | `drover app show <name>` | `GET /apps/<name>/spec` (env names only) |
 | List | `drover app list` | `GET /apps` |
@@ -248,7 +252,8 @@ Status body:
                "started":"2026-11-16T15:44:00Z"}]}
 ```
 
-Instance `state`: `healthy` (gets traffic), `unhealthy` (running, failing its check), `down` (exited, waiting
+Instance `state`: `healthy` (gets traffic), `starting` (running, has not passed `ready.path` yet),
+`unhealthy` (running, failing its check), `down` (exited, waiting
 to restart), `draining` (old instance finishing requests), `empty` (no binary to run yet). `restarts` counts
 exits of that instance since it was started.
 
@@ -293,6 +298,8 @@ kept there as `tree.tar.gz` and unpacked into the cache on first run; a binary g
 | Instances `unhealthy` | Process runs but `health.path` does not return 2xx/3xx, or it listens on another interface or port. |
 | Upload returns 500 `keeps exiting right after start` | The new binary crashes on start. Old version still serves. The reason is in the error (`its last output:`) and in `drover logs <app>`. Fix the build; `drover rm <app> <v>` removes the bad one. |
 | Upload returns 500 `not healthy after ...` | The new binary starts too slowly or fails its health check. Raise `start_timeout` or fix the check. |
+| Upload returns 500 `not ready after ...` | The new version never passed `ready.path` (often a dependency it cannot reach with its settings). Old version still serves. |
+| Instances `starting` | Running but not passing `ready.path` yet. They get no traffic until it answers 2xx/3xx. |
 | 409 on upload | That version name exists. Pick another or delete it. |
 | 502 `upstream error` | The instance accepted the request, then failed. Such a request is not retried. |
 | drover refuses to start: `not loopback` | `admin.listen` is on the network without a token. Set `DROVER_TOKEN`. |

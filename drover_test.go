@@ -287,6 +287,66 @@ func TestBadBinaryIsNotActivated(t *testing.T) {
 	}
 }
 
+func TestReadiness(t *testing.T) {
+	notReady := filepath.Join(t.TempDir(), "down")
+	h := startDrover(t, func(c *Config) {
+		c.Apps[0].Ready.Path = "ready" // the leading slash is added
+		c.Apps[0].Env = map[string]string{"FAKEAPP_NOT_READY": notReady}
+		c.Apps[0].StartTimeout = 1500 * time.Millisecond
+	})
+	if r := h.d.apps[0].cfg.Ready; r.Path != "/ready" || r.Interval != 250*time.Millisecond || r.Timeout != h.d.apps[0].cfg.Health.Timeout {
+		t.Fatalf("ready = %+v; want the leading slash added, interval 250ms and the health check's timeout", r)
+	}
+
+	// The dependency goes down: the live instances fail /ready but pass /health, so they keep serving.
+	if err := os.WriteFile(notReady, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond) // several health intervals
+	if versions, pids := h.served(20); !versions["v1"] || len(pids) != 2 {
+		t.Fatalf("live instances left the pool when only /ready failed: %v %v", versions, pids)
+	}
+
+	// A new version that never gets ready is not switched to, and says why.
+	raw, _ := os.ReadFile(binV2)
+	code, body := h.do(http.MethodPut, "/apps/web/releases/v2", bytes.NewReader(raw))
+	if code != 500 || !strings.Contains(body, "not ready") || !strings.Contains(body, "/ready") {
+		t.Fatalf("want 500 not ready, got %d %s", code, body)
+	}
+	if st := h.status(); st.Version != versionBuiltin {
+		t.Fatalf("a version that was not ready became current: %+v", st)
+	}
+
+	// A restarted instance has to pass /ready again: it stays out of the pool until then.
+	killed := h.status().Instances[0]
+	if err := syscall.Kill(int(killed.PID), syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	h.waitFor("the killed instance to run again", func() bool {
+		in := h.status().Instances[0]
+		return in.PID != 0 && in.PID != killed.PID
+	})
+	time.Sleep(400 * time.Millisecond)
+	if in := h.status().Instances[0]; in.State != "starting" {
+		t.Fatalf("a restarted instance that fails /ready: want state starting, got %+v", in)
+	}
+	if _, pids := h.served(20); len(pids) != 1 {
+		t.Fatalf("an instance that is not ready got traffic: %v", pids)
+	}
+
+	// The dependency is back: the instance joins, and the version can now be switched to.
+	if err := os.Remove(notReady); err != nil {
+		t.Fatal(err)
+	}
+	h.waitFor("the restarted instance to be ready", func() bool { return h.status().Instances[0].State == "healthy" })
+	if code, body := h.do(http.MethodPost, "/apps/web/releases/v2/activate", nil); code != 200 {
+		t.Fatalf("activate once ready: %d %s", code, body)
+	}
+	if versions, _ := h.served(20); !versions["v2"] || len(versions) != 1 {
+		t.Fatalf("want v2 only, got %v", versions)
+	}
+}
+
 func TestFetchFromURLAndImage(t *testing.T) {
 	raw, _ := os.ReadFile(binV2)
 	sum := sha256.Sum256(raw)
@@ -1300,7 +1360,7 @@ func TestAppsThroughTheAPI(t *testing.T) {
 	os.WriteFile(bin, raw, 0o755)
 	h := startDrover(t, func(c *Config) { c.Admin.ManageApps = true })
 	spec := map[string]any{"name": "api", "command": []string{bin, "--port", "{port}"}, "listen": "127.0.0.1:0",
-		"instances": 2, "health": map[string]any{"path": "/health", "interval": "100ms"},
+		"instances": 2, "health": map[string]any{"path": "/health", "interval": "100ms"}, "ready": map[string]any{"path": "/ready", "timeout": "1s"},
 		"env": map[string]string{"GREETING": "hi", "API_KEY": "s3cret"}}
 	code, body := h.addApp(spec)
 	if code != 201 || !strings.Contains(body, `"origin":"api"`) {
@@ -1325,7 +1385,7 @@ func TestAppsThroughTheAPI(t *testing.T) {
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("apps.json: %v %v", info, err)
 	}
-	if _, body := h.do(http.MethodGet, "/apps/api/spec", nil); strings.Contains(body, "s3cret") || !strings.Contains(body, `"API_KEY"`) || !strings.Contains(body, `"port_base"`) {
+	if _, body := h.do(http.MethodGet, "/apps/api/spec", nil); strings.Contains(body, "s3cret") || !strings.Contains(body, `"API_KEY"`) || !strings.Contains(body, `"port_base"`) || !strings.Contains(body, `"ready": {`) || !strings.Contains(body, `"path": "/ready"`) {
 		t.Fatalf("spec: %s", body)
 	}
 	// Versions work the same as for any app.

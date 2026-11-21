@@ -56,6 +56,14 @@ apps:
       path: ""          # GET this path, 2xx/3xx is healthy. Empty: the port accepting a connection is enough.
       interval: 2s
       timeout: 2s
+    # Optional readiness check. A started or restarted instance gets traffic only once ready.path answers
+    # 2xx/3xx, and a rollout waits for it before switching. After that only health keeps an instance in the
+    # pool, so this can check the app's database or other dependencies without an outage of them taking every
+    # live instance out at once. Empty path: health is used for both.
+    ready:
+      path: ""
+      interval: 250ms   # how often an instance that is not ready yet is asked
+      timeout: 2s       # default: health.timeout
     start_timeout: 30s  # how long a new instance has to become healthy before a rollout is called off
     drain_timeout: 30s  # how long an old instance may finish its open requests
     stop_timeout: 10s   # after stop_signal, how long until SIGKILL
