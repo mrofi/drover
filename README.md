@@ -179,6 +179,16 @@ curl -T ./app localhost:9100/apps/app/releases/1.4.2
 wget -qO- --method=PUT --body-file=./app localhost:9100/apps/app/releases/1.4.2
 ```
 
+Image sources need a running image-file-fetch server: its base URL, e.g. `http://image-file-fetch:8080` or
+`https://fetch.example.com` (drover adds `/download`). There is no default. Without one, only image sources are
+refused; URLs and uploads work as usual. drover does not run image-file-fetch on demand. Without a server, take
+the file out yourself with image-file-fetch's CLI mode (or `docker cp`) and upload it:
+
+```sh
+docker run --rm ghcr.io/mrofi/image-file-fetch fetch -output - ghcr.io/me/app:1.4.2 /usr/local/bin/app > app
+curl -T ./app localhost:9100/apps/app/releases/1.4.2
+```
+
 Each of these stores the version and rolls it out. The call returns when the rollout is over, with the new
 status (200) or the reason it was called off (500, and the app is still on the version from before). Add
 `"activate": false` (or `?activate=false` on an upload) to store a version without switching to it.
@@ -375,7 +385,7 @@ exit 1. Response codes and JSON shapes are in [`llms.txt`](llms.txt).
 | `DROVER_TOKEN` | server, client | Admin API token. On the server it wins over `admin.token`. |
 | `DROVER_DATA` | server | Data directory, when `data:` and `--data` are not set. Default `~/.local/share/drover`. |
 | `DROVER_CACHE` | server | Where folder versions are unpacked, when `cache:` and `--cache` are not set. Default `~/.cache/drover`. |
-| `DROVER_IMAGE_FETCH_URL` | server | image-file-fetch server for image sources. Wins over `image_fetch_url`. |
+| `DROVER_IMAGE_FETCH_URL` | server | Base URL of the image-file-fetch server for image sources, e.g. `http://image-file-fetch:8080`. Wins over `image_fetch_url`. No default: without it, image sources are refused. |
 | `DROVER_MANAGE_APPS` | server | `1` or `true`: allow adding and removing apps through the API. |
 | `DROVER_ADMIN` | client | URL of the admin API, default `http://127.0.0.1:9100`. |
 | `PORT`, `DROVER_APP`, `DROVER_INDEX`, `DROVER_VERSION`, `DROVER_DIR` | set for each instance | Its port, app name, instance number, version and, for a folder app, the folder of that version. |

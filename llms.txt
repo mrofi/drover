@@ -91,7 +91,7 @@ cache: /home/app/.cache/drover        # default $HOME/.cache/drover; env DROVER_
 admin:
   listen: 127.0.0.1:9100              # flag --admin or env DROVER_ADMIN_LISTEN win
   token: ""                           # env DROVER_TOKEN wins. Required when listen is not loopback.
-image_fetch_url: ""                   # env DROVER_IMAGE_FETCH_URL. Needed only for image sources.
+image_fetch_url: ""                   # env DROVER_IMAGE_FETCH_URL. Base URL (drover adds /download). No default; needed only for image sources.
 max_binary_bytes: 1073741824
 log_lines: 1000                       # recent lines kept in memory per app for the logs endpoint
 metrics:
