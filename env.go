@@ -12,7 +12,8 @@ import (
 
 // An instance's environment is built from four layers, later ones winning:
 //
-//  1. drover's own environment (without DROVER_TOKEN)
+//  1. drover's own environment (without DROVER_TOKEN and other apps' env_prefix variables), then the
+//     variables of the app's env_prefix under their names without it
 //  2. env: in the config
 //  3. the app's env_file, read every time an instance is started
 //  4. overrides set through the API, kept in memory only
@@ -33,6 +34,55 @@ var reservedEnv = map[string]bool{"PORT": true, "DROVER_APP": true, "DROVER_INDE
 type envChange struct {
 	Set   map[string]string `json:"set"`
 	Unset []string          `json:"unset"`
+}
+
+// prefixesOverlap reports whether one env_prefix starts with the other: a variable could then belong to both.
+func prefixesOverlap(a, b string) bool {
+	return a != "" && b != "" && (strings.HasPrefix(a, b) || strings.HasPrefix(b, a))
+}
+
+// baseEnv is drover's own environment as one instance of the app gets it: without DROVER_TOKEN, without
+// the variables of any app's env_prefix (others is every app's prefix), and with those of its own prefix
+// under their names without it. A name that would be invalid or one drover sets itself is left out.
+func baseEnv(environ []string, own string, others []string) []string {
+	var env, mine []string
+	for _, kv := range environ {
+		name, value, _ := strings.Cut(kv, "=")
+		if name == "DROVER_TOKEN" {
+			continue // the admin token lets its holder replace binaries: the apps do not get it
+		}
+		if n, ok := strings.CutPrefix(name, own); own != "" && ok {
+			if envKeyRe.MatchString(n) && !reservedEnv[n] {
+				mine = append(mine, n+"="+value)
+			}
+			continue
+		}
+		taken := false
+		for _, p := range others {
+			taken = taken || (p != "" && strings.HasPrefix(name, p))
+		}
+		if !taken {
+			env = append(env, kv)
+		}
+	}
+	sort.Strings(mine)
+	return append(env, mine...) // after the rest, so KV_S3_BUCKET wins over a plain S3_BUCKET
+}
+
+// prefixedNames lists the variables the app gets through its env_prefix, under the names it sees.
+func (a *App) prefixedNames() []string {
+	names := []string{}
+	if a.cfg.EnvPrefix == "" {
+		return names
+	}
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if n, ok := strings.CutPrefix(name, a.cfg.EnvPrefix); ok && envKeyRe.MatchString(n) && !reservedEnv[n] {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 func checkEnvKey(k string) error {
@@ -321,6 +371,10 @@ func mustNames(data []byte) []string {
 // EnvStatus reports where an app's variables come from. Names only: values are never returned.
 type EnvStatus struct {
 	EnvFile string `json:"env_file,omitempty"`
+	// EnvPrefix and Prefixed: the variables taken from drover's environment through env_prefix, by the
+	// names the app sees.
+	EnvPrefix string   `json:"env_prefix,omitempty"`
+	Prefixed  []string `json:"prefixed"`
 	// Pending: the stored environment is not what the running instances have; the next rollout applies it.
 	Pending   bool     `json:"pending"`
 	File      []string `json:"file"`
@@ -331,7 +385,8 @@ type EnvStatus struct {
 }
 
 func (a *App) envStatus() EnvStatus {
-	st := EnvStatus{EnvFile: a.cfg.EnvFile, File: []string{}, Overrides: a.overrideNames(), Config: []string{},
+	st := EnvStatus{EnvFile: a.cfg.EnvFile, EnvPrefix: a.cfg.EnvPrefix, Prefixed: a.prefixedNames(),
+		File: []string{}, Overrides: a.overrideNames(), Config: []string{},
 		Reserved: []string{"DROVER_APP", "DROVER_INDEX", "DROVER_VERSION", "PORT"}}
 	_, names, err := a.readEnvFile()
 	if err != nil {

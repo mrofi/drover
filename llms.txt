@@ -121,6 +121,7 @@ apps:
     dir: ""                           # working directory
     env: {}                           # extra environment variables
     env_file: ""                      # KEY=VALUE file read at each instance start; wins over env
+    env_prefix: ""                    # e.g. KV_: drover's KV_X is X in this app only (see Environment)
 ```
 
 ## Apps added through the API
@@ -130,7 +131,7 @@ Only when the server runs with `admin.manage_apps: true`, `--manage-apps` or `DR
 
 | Goal | CLI | HTTP |
 |---|---|---|
-| Add | `drover app add <name> --listen <addr> [--instances n] [--port-base p] [--health /h] [--ready /r] [--folder d] [--binary f] [--env-file f] [--env K=V]... -- <command>` | `POST /apps` with the config keys as JSON: `{"name","command"(string or list),"listen","instances","port_base","health":{"path","interval","timeout"},"ready":{"path","interval","timeout"},"folder","binary","env_file","env":{},"dir","start_timeout","drain_timeout","stop_timeout","try_duration","stop_signal"}`; durations as strings |
+| Add | `drover app add <name> --listen <addr> [--instances n] [--port-base p] [--health /h] [--ready /r] [--folder d] [--binary f] [--env-file f] [--env-prefix P_] [--env K=V]... -- <command>` | `POST /apps` with the config keys as JSON: `{"name","command"(string or list),"listen","instances","port_base","health":{"path","interval","timeout"},"ready":{"path","interval","timeout"},"folder","binary","env_file","env_prefix","env":{},"dir","start_timeout","drain_timeout","stop_timeout","try_duration","stop_signal"}`; durations as strings |
 | Remove | `drover app rm <name> [--purge]` | `DELETE /apps/<name>[?purge=true]` |
 | Show its definition | `drover app show <name>` | `GET /apps/<name>/spec` (env names only) |
 | List | `drover app list` | `GET /apps` |
@@ -185,11 +186,17 @@ not `builtin`. A name cannot be reused; delete it first.
 
 ### Environment
 
-Layers, later wins: (1) drover's own environment minus `DROVER_TOKEN`, (2) config `env:`, (3) the app's
+Layers, later wins: (1) drover's own environment minus `DROVER_TOKEN` and minus every app's `env_prefix`
+variables, then the app's own `env_prefix` variables without the prefix, (2) config `env:`, (3) the app's
 `env_file`, read at each instance start, (4) overrides set through the API, in memory only and lost when
 drover restarts, (5) `PORT`, `DROVER_APP`, `DROVER_INDEX`, `DROVER_VERSION`, always set by drover and not
 changeable.
 
+- `env_prefix: KV2_` (`--env-prefix`, `"env_prefix"`): drover's `KV2_S3_BUCKET` is `S3_BUCKET` in that app
+  only; no other app sees it. For two copies of one service with different settings. Prefixes may not
+  overlap (`KV_`/`KV_B_`: 409 through the API) or touch `DROVER_` (400). Never handed over: `PORT`,
+  `DROVER_*`, names invalid without the prefix. Read at instance start: a newly added prefix keeps its
+  variables from other apps' instances only after their next rollout/restart.
 - Every env call does a rolling restart and returns when it is over. If the instances do not come up, the
   change is undone (file content or overrides restored), the old instances keep serving, and the answer is
   500 with the new instances' last output.
@@ -201,7 +208,7 @@ changeable.
   `drover restart <app>` applies it.
 - A hand-edited `env_file` takes effect at the next `drover restart <app>` or rollout, not on a crash restart.
 - Values are never returned: `GET /apps/<app>/env` gives
-  `{"env_file","file":[names],"overrides":[names],"config":[names],"reserved":[names]}`; status has
+  `{"env_file","env_prefix","prefixed":[names],"file":[names],"overrides":[names],"config":[names],"reserved":[names]}`; status has
   `"env_overrides":[names]`.
 - File format: `KEY=VALUE` lines, `#` comment lines, optional `export `, values optionally in single quotes
   (literal) or double quotes (`\n` `\"` `\\` unescaped). No `$VAR` expansion, no trailing comments. A

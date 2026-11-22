@@ -75,3 +75,6 @@ apps:
     # KEY=VALUE file read each time an instance is started; wins over env. Change it by hand and run
     # `drover restart web`, or through `drover env set web --file KEY=VALUE`. Empty: none.
     env_file: ""
+    # Variables of drover's own environment that start with this are given to this app without it, and to
+    # no other app: with KV_, KV_S3_BUCKET is S3_BUCKET here. Empty: none.
+    env_prefix: ""

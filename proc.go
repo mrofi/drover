@@ -131,12 +131,11 @@ func (p *proc) command() *exec.Cmd {
 	cfg := p.app.cfg
 	cmd := exec.Command(p.argv[0], p.argv[1:]...)
 	cmd.Dir = p.workdir
-	for _, kv := range os.Environ() {
-		// The admin token lets its holder replace binaries: the apps do not get it.
-		if !strings.HasPrefix(kv, "DROVER_TOKEN=") {
-			cmd.Env = append(cmd.Env, kv)
-		}
+	var others []string
+	if p.app.envPrefixes != nil {
+		others = p.app.envPrefixes()
 	}
+	cmd.Env = baseEnv(os.Environ(), cfg.EnvPrefix, others)
 	for _, kv := range p.env {
 		cmd.Env = append(cmd.Env, p.repl.Replace(kv)) // PYTHONPATH={dir}/deps and the like
 	}

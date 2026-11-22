@@ -40,6 +40,9 @@ type App struct {
 	closed    bool
 	overrides map[string]string // variables set through the API, in memory only
 
+	// envPrefixes returns the env_prefix of every app drover runs, so an app never gets another one's.
+	envPrefixes func() []string
+
 	rollMu  sync.Mutex
 	rolling atomic.Bool
 	next    atomic.Uint64

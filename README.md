@@ -329,7 +329,7 @@ curl -X DELETE 'localhost:9100/apps/api?purge=true'
   restarts, on the version each was running. That only holds if the data directory is on a volume; without
   one, a container restart loses them, their versions included.
 - **`env` values given here are written to `apps.json`** (mode 0600, readable by drover only). Secrets
-  belong in an `env_file`; the API only ever shows the names.
+  belong in an `env_file`, or in drover's environment with an `env_prefix`; the API only ever shows the names.
 - **Apps from the config file cannot be changed or removed through the API.** If the config file later
   defines an app with the name of an API app, the config wins: the API app is left out with a warning,
   stays recorded, and can be removed with `drover app rm`.
@@ -425,11 +425,48 @@ An instance's environment is built in layers, later ones winning:
 
 | | Source | Changed by | Survives a restart of drover |
 |---|---|---|---|
-| 1 | drover's own environment (`ENV` in the Dockerfile, `docker run -e`), without `DROVER_TOKEN` | restarting drover | yes |
+| 1 | drover's own environment (`ENV` in the Dockerfile, `docker run -e`), without `DROVER_TOKEN` and other apps' `env_prefix` variables; then those of the app's own `env_prefix`, without the prefix | restarting drover | yes |
 | 2 | `env:` in the config | restarting drover | yes |
 | 3 | the app's `env_file` (`--env-file`), read each time an instance is started | editing the file, or the API | yes, it is your file |
 | 4 | overrides set through the API, kept in memory | the API | **no** |
 | 5 | `PORT`, `DROVER_APP`, `DROVER_INDEX`, `DROVER_VERSION`, `DROVER_DIR` | nobody: drover sets them | |
+
+### Settings per app from drover's environment: `env_prefix`
+
+Two apps that read the same names (two copies of one service, say) can each get their own values from the
+container's environment:
+
+```yaml
+apps:
+  - name: kv
+    command: /usr/local/bin/kv
+    listen: ":8090"
+    env_prefix: KV_      # KV_S3_BUCKET in drover's environment is S3_BUCKET in kv
+  - name: kv2
+    command: /usr/local/bin/kv
+    listen: ":8091"
+    env_prefix: KV2_     # KV2_S3_BUCKET is S3_BUCKET in kv2
+```
+
+```sh
+docker run -e KV_S3_BUCKET=a -e KV2_S3_BUCKET=b ...
+drover app add kv2 --listen :8091 --env-prefix KV2_ -- /usr/local/bin/kv     # or through the API
+```
+
+- **A variable with an app's prefix reaches only that app.** kv never sees `KV2_S3_BUCKET` (nor
+  `KV_S3_BUCKET` as such), and an app without a prefix sees neither. Variables without any app's prefix go
+  to every app as before.
+- **The prefixed variable wins over the same name without it** (`KV_S3_BUCKET` over a plain `S3_BUCKET`), and
+  `env:`, the `env_file` and overrides win over both.
+- **Not handed over:** names drover sets itself (`KV_PORT`, `KV_DROVER_TOKEN`, ...) and names that would not be
+  valid without the prefix (`KV_1X`).
+- **Prefixes must not overlap**: `KV_` and `KV_B_` (or `KV`) are refused, as is anything overlapping
+  `DROVER_`. Letters, digits and `_` only.
+- **Taken when an instance starts**, so an app added later keeps its variables from the instances of the
+  others only from their next rollout or restart.
+- `drover env <app>` lists, by name, what came through the prefix (`"prefixed"`).
+
+### Changing variables without downtime
 
 To change variables without downtime, put them in an `env_file` and restart the instances one by one:
 

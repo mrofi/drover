@@ -51,6 +51,7 @@ type appSpec struct {
 	Dir          string            `json:"dir,omitempty"`
 	Env          map[string]string `json:"env,omitempty"`
 	EnvFile      string            `json:"env_file,omitempty"`
+	EnvPrefix    string            `json:"env_prefix,omitempty"`
 }
 
 type healthSpec struct {
@@ -82,7 +83,8 @@ func (c *Command) UnmarshalJSON(b []byte) error {
 func (s appSpec) toConfig() (*AppConfig, error) {
 	cfg := &AppConfig{Name: s.Name, Command: append(Command(nil), s.Command...), Binary: s.Binary,
 		Folder: s.Folder, Listen: s.Listen, Instances: s.Instances, PortBase: s.PortBase,
-		Health: HealthConfig{Path: s.Health.Path}, Ready: ReadyConfig{Path: s.Ready.Path}, StopSignal: s.StopSignal, Dir: s.Dir, EnvFile: s.EnvFile}
+		Health: HealthConfig{Path: s.Health.Path}, Ready: ReadyConfig{Path: s.Ready.Path}, StopSignal: s.StopSignal, Dir: s.Dir, EnvFile: s.EnvFile,
+		EnvPrefix: s.EnvPrefix}
 	if len(s.Env) > 0 {
 		cfg.Env = map[string]string{}
 		for k, v := range s.Env {
@@ -170,6 +172,9 @@ func prepare(spec *appSpec, apps []*App) (*AppConfig, error) {
 		if overlaps(cfg, a.cfg) {
 			return nil, fmt.Errorf("instance ports %d-%d overlap those of app %q", cfg.PortBase, cfg.PortBase+2*cfg.Instances-1, a.cfg.Name)
 		}
+		if prefixesOverlap(cfg.EnvPrefix, a.cfg.EnvPrefix) {
+			return nil, fmt.Errorf("env_prefix %q overlaps %q of app %q: one starts with the other", cfg.EnvPrefix, a.cfg.EnvPrefix, a.cfg.Name)
+		}
 	}
 	spec.PortBase, spec.Instances = cfg.PortBase, cfg.Instances
 	return cfg, nil
@@ -212,6 +217,7 @@ func (d *Drover) loadManaged() error {
 			continue
 		}
 		a.origin = originAPI
+		a.envPrefixes = d.envPrefixes
 		d.apps = append(d.apps, a)
 	}
 	return nil
@@ -251,6 +257,7 @@ func (d *Drover) addApp(spec appSpec) (*App, error) {
 		return nil, err
 	}
 	a.origin = originAPI
+	a.envPrefixes = d.envPrefixes
 	undo := func() {
 		if errors.Is(statErr, os.ErrNotExist) {
 			os.RemoveAll(dataDir)

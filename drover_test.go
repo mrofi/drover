@@ -1655,3 +1655,99 @@ func TestExtractWithoutALimitKeepsContent(t *testing.T) {
 		t.Fatalf("unpacked with no limit: %q", raw)
 	}
 }
+
+func TestEnvPrefix(t *testing.T) {
+	t.Setenv("KV_GREETING", "from-kv")
+	t.Setenv("GREETING", "plain")             // the prefixed one wins over it
+	t.Setenv("KV_FROM_CONFIG", "from-prefix") // config env wins over the prefix
+	t.Setenv("OTHER_GREETING", "from-other")  // only for the app with OTHER_
+	t.Setenv("API_GREETING", "from-api")      // only for the app added through the API with API_
+	t.Setenv("SHARED", "everyone")            // no prefix: every app
+	t.Setenv("KV_PORT", "1")                  // set by drover: never from a prefix
+	t.Setenv("KV_DROVER_TOKEN", "leak")       // would hand the admin token to the app
+	t.Setenv("KV_1BAD", "x")                  // not a valid name without the prefix
+	otherBin := filepath.Join(t.TempDir(), "other")
+	raw, _ := os.ReadFile(binV1)
+	os.WriteFile(otherBin, raw, 0o755)
+	h := startDrover(t, func(c *Config) {
+		c.Admin.ManageApps = true
+		c.Apps[0].EnvPrefix = "KV_"
+		c.Apps[0].Env = map[string]string{"FROM_CONFIG": "from-config"}
+		c.Apps = append(c.Apps, &AppConfig{Name: "other", Command: Command{otherBin, "--port", "{port}"},
+			Listen: "127.0.0.1:0", Instances: 1, PortBase: int(nextBase.Add(20)), EnvPrefix: "OTHER_",
+			Health: HealthConfig{Path: "/health", Interval: 100 * time.Millisecond}, StartTimeout: 10 * time.Second})
+	})
+	one := func(name, want string) {
+		t.Helper()
+		if got := h.envOf(name); len(got) != 1 || !got[want] {
+			t.Fatalf("web: %s: want %q on every instance, got %v", name, want, got)
+		}
+	}
+	one("GREETING", "from-kv")
+	one("FROM_CONFIG", "from-config")
+	one("SHARED", "everyone")
+	one("KV_GREETING", "")          // handed over without the prefix only
+	one("OTHER_GREETING", "")       // another app's
+	one("API_GREETING", "from-api") // no app has API_ yet: a plain variable
+	one("DROVER_TOKEN", "")
+	one("1BAD", "")
+
+	other, _ := h.appStatus("other")
+	h.waitFor("the other app", func() bool {
+		other, _ = h.appStatus("other")
+		return len(other.Instances) == 1 && other.Instances[0].State == "healthy"
+	})
+	for name, want := range map[string]string{"GREETING": "from-other", "KV_GREETING": "", "SHARED": "everyone", "OTHER_GREETING": ""} {
+		if _, body := getVia(other.Listen, "/env?name="+name); strings.TrimSpace(body) != want {
+			t.Fatalf("other: %s = %q, want %q", name, strings.TrimSpace(body), want)
+		}
+	}
+
+	// The env endpoint names what came through the prefix, never the values.
+	if code, body := h.do(http.MethodGet, "/apps/web/env", nil); code != 200 || strings.Contains(body, "from-kv") ||
+		!strings.Contains(body, `"env_prefix":"KV_"`) || !strings.Contains(body, `"prefixed":["FROM_CONFIG","GREETING"]`) {
+		t.Fatalf("web env: %d %s", code, body)
+	}
+
+	// Through the API: its own prefix, recorded in the spec; once it is there, the other apps' new instances
+	// no longer get its variables.
+	apiBin := filepath.Join(t.TempDir(), "api-app")
+	os.WriteFile(apiBin, raw, 0o755)
+	spec := map[string]any{"name": "api", "command": []string{apiBin, "--port", "{port}"}, "listen": "127.0.0.1:0",
+		"instances": 1, "health": map[string]any{"path": "/health", "interval": "100ms"}, "env_prefix": "API_"}
+	code, body := h.addApp(spec)
+	if code != 201 {
+		t.Fatalf("add: %d %s", code, body)
+	}
+	var st AppStatus
+	h.waitFor("the API app", func() bool {
+		st, _ = h.appStatus("api")
+		return len(st.Instances) == 1 && st.Instances[0].State == "healthy"
+	})
+	if _, body := getVia(st.Listen, "/env?name=GREETING"); strings.TrimSpace(body) != "from-api" {
+		t.Fatalf("api: GREETING = %q", body)
+	}
+	if _, body := h.do(http.MethodGet, "/apps/api/spec", nil); !strings.Contains(body, `"env_prefix": "API_"`) {
+		t.Fatalf("spec: %s", body)
+	}
+	if code, body := h.do(http.MethodPost, "/apps/web/restart", nil); code != 200 {
+		t.Fatalf("restart: %d %s", code, body)
+	}
+	one("API_GREETING", "")
+
+	// Refused: prefixes that overlap another app's, or drover's own, or are not a name.
+	// Another app's (409, like overlapping ports) or not one at all (400).
+	for p, want := range map[string]int{"KV": 409, "KV_X_": 409, "OTHER_": 409, "DROVER_": 400, "DRO": 400, "bad-prefix": 400, "1X_": 400} {
+		spec := map[string]any{"name": "x", "command": []string{apiBin, "--port", "{port}"}, "listen": "127.0.0.1:0", "env_prefix": p}
+		if code, body := h.addApp(spec); code != want || !strings.Contains(body, "env_prefix") {
+			t.Fatalf("env_prefix %q: want %d, got %d %s", p, want, code, body)
+		}
+	}
+	cfg := &Config{Data: t.TempDir(), Apps: []*AppConfig{
+		{Name: "a", Command: Command{apiBin}, Listen: ":0", EnvPrefix: "KV_"},
+		{Name: "b", Command: Command{apiBin}, Listen: ":0", PortBase: 12000, EnvPrefix: "KV_B_"},
+	}}
+	if _, err := newDrover(cfg); err == nil || !strings.Contains(err.Error(), "env_prefix") {
+		t.Fatalf("overlapping prefixes in the config: %v", err)
+	}
+}

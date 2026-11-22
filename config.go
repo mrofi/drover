@@ -71,7 +71,10 @@ type AppConfig struct {
 	Env          map[string]string `yaml:"env"`
 	// EnvFile is a KEY=VALUE file read every time an instance is started. It wins over Env.
 	EnvFile string `yaml:"env_file"`
-	Dir     string `yaml:"dir"`
+	// EnvPrefix hands drover's own variables that start with it to this app, without it: with "KV_",
+	// KV_S3_BUCKET is S3_BUCKET in the app. Variables with any app's prefix reach only that app.
+	EnvPrefix string `yaml:"env_prefix"`
+	Dir       string `yaml:"dir"`
 
 	stopSignal syscall.Signal
 	folderMode bool
@@ -250,6 +253,9 @@ func (c *Config) normalize() error {
 			if overlaps(a, b) {
 				return fmt.Errorf("apps %q and %q have overlapping instance ports (set port_base)", a.Name, b.Name)
 			}
+			if prefixesOverlap(a.EnvPrefix, b.EnvPrefix) {
+				return fmt.Errorf("apps %q and %q have env_prefix %q and %q: one starts with the other", a.Name, b.Name, a.EnvPrefix, b.EnvPrefix)
+			}
 		}
 	}
 	return nil
@@ -296,6 +302,14 @@ func (a *AppConfig) normalize(index int) error {
 			a.Command = append(Command{"{bin}"}, a.Command[1:]...)
 		} else {
 			return errors.New("binary is set but command has no {bin} placeholder")
+		}
+	}
+	if a.EnvPrefix != "" {
+		if !envKeyRe.MatchString(a.EnvPrefix) {
+			return fmt.Errorf("env_prefix %q: letters, digits and _ only, not starting with a digit", a.EnvPrefix)
+		}
+		if prefixesOverlap(a.EnvPrefix, "DROVER_") {
+			return fmt.Errorf("env_prefix %q would take drover's own DROVER_ variables", a.EnvPrefix)
 		}
 	}
 	if a.EnvFile != "" {

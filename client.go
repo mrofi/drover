@@ -198,6 +198,7 @@ func runApp(args []string) error {
 		fs.StringVar(&spec.Folder, "folder", "", "built-in folder of a folder app ({dir} in the command)")
 		fs.StringVar(&spec.Binary, "binary", "", "the file releases replace, when it is not the first word")
 		fs.StringVar(&spec.EnvFile, "env-file", "", "KEY=VALUE file read at every instance start")
+		fs.StringVar(&spec.EnvPrefix, "env-prefix", "", "give drover's variables with this prefix to the app without it (KV_S3_BUCKET -> S3_BUCKET)")
 		fs.StringVar(&spec.Dir, "dir", "", "working directory")
 		fs.Func("env", "KEY=VALUE for the app's environment, stored in apps.json (repeatable; secrets belong in --env-file)", func(kv string) error {
 			k, v, ok := strings.Cut(kv, "=")

@@ -40,12 +40,24 @@ func newDrover(cfg *Config) (*Drover, error) {
 			return nil, fmt.Errorf("app %q: %w", ac.Name, err)
 		}
 		a.origin = originConfig
+		a.envPrefixes = d.envPrefixes
 		d.apps = append(d.apps, a)
 	}
 	if err := d.loadManaged(); err != nil {
 		return nil, err
 	}
 	return d, nil
+}
+
+// envPrefixes returns the env_prefix of every app, for the instances' environments.
+func (d *Drover) envPrefixes() []string {
+	var out []string
+	for _, a := range d.appList() {
+		if a.cfg.EnvPrefix != "" {
+			out = append(out, a.cfg.EnvPrefix)
+		}
+	}
+	return out
 }
 
 // appList returns the apps as they are now. Apps can be added and removed while drover runs.
