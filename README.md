@@ -39,6 +39,10 @@ flowchart LR
 - **Observe.** Recent output of every instance over HTTP, and Prometheus metrics.
 - **No root.** It writes only to its data and cache directories and uses no privileged calls. Linux only.
 
+**Image:** [`ghcr.io/mrofi/drover`](https://github.com/users/mrofi/packages/container/package/drover): `:latest`
+(and `:<version>`), to copy the binary from (see [Adding it to an image](#adding-it-to-an-image)). Every tag is
+listed on that page. The plain binaries are on the [releases](https://github.com/mrofi/drover/releases) page.
+
 **Contents:** [Quick start](#quick-start) · [Moving an existing command](#moving-an-existing-command-to-drover) ·
 [Updating the binary](#updating-the-binary) ·
 [Folder apps](#folder-apps-php-node-python) · [Adding apps through the API](#adding-apps-through-the-api) · [Commands](#commands) · [Configuration](#configuration) ·
